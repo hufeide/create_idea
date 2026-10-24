@@ -31,7 +31,7 @@ def _chunk_to_text(chunk):
 
 
 class Commander:
-    def __init__(self):
+    def __init__(self, session_dir=None, conversation_id=None):
         self._cm = None
         self._agent = None
         self._lock = asyncio.Lock()
@@ -39,8 +39,27 @@ class Commander:
         self._start_error = None
         self._recorded_init = False
         self._si = ""
+        # Session binding: when set, the commander's chat is persisted under the
+        # session's save_dir and resumes via conversation_id across restarts.
+        self.session_dir = session_dir
+        # None => first connect lets the SDK create a fresh conversation and assign
+        # an id (read back via self._agent.conversation_id); we persist that id so
+        # later turns / restarts resume the SAME session. Passing an id absent from
+        # save_dir makes the SDK raise "cannot resume".
+        self.conversation_id = conversation_id
         # Chronological coordinator trace — viewable via GET /api/trace/commander.
         self.transcript = []
+
+    def bind_session(self, session_dir, conversation_id=None):
+        """Attach this commander to a canvas session so its chat persists/resumes."""
+        self.session_dir = session_dir
+        # Keep an already-established id (resume) unless an explicit one is given.
+        if conversation_id is not None:
+            self.conversation_id = conversation_id
+        # Force a fresh connection on next use with the new session params.
+        self._start_attempted = False
+        self._agent = None
+        self._cm = None
 
     async def start(self):
         if not SDK_OK:
@@ -52,22 +71,52 @@ class Commander:
             "请基于给定的画布状态给出协调方案，简明扼要。"
         )
         self._si = si
+
+        async def _connect():
+            # Commander is a pure text coordinator: no tools needed, so strip the
+            # default tool schemas and use MINIMAL behavior to shrink ctx.
+            caps = types.CapabilitiesConfig(
+                enabled_tools=[],
+                enable_subagents=False,
+                agent_behavior=types.AgentBehavior.MINIMAL,
+            )
+            self._cm = Agent(build_agent_config(
+                system_instructions=self._si, capabilities=caps,
+                save_dir=(str(self.session_dir / "agent_data")
+                          if self.session_dir else None),
+                conversation_id=(self.conversation_id
+                                 if self.session_dir and self.conversation_id
+                                 else None),
+            ))
+            self._agent = await self._cm.__aenter__()
+            # Capture the id the SDK assigned on a fresh connection so the session
+            # can be resumed after restarts.
+            if self.conversation_id is None and self._agent is not None:
+                cid = getattr(self._agent, "conversation_id", None)
+                if cid:
+                    self.conversation_id = cid
+
         try:
-            with quiet_sdk_start():
-                # Commander is a pure text coordinator: no tools needed, so strip
-                # the default tool schemas and use MINIMAL behavior to shrink ctx.
-                caps = types.CapabilitiesConfig(
-                    enabled_tools=[],
-                    enable_subagents=False,
-                    agent_behavior=types.AgentBehavior.MINIMAL,
-                )
-                self._cm = Agent(build_agent_config(
-                    system_instructions=si, capabilities=caps))
-                self._agent = await self._cm.__aenter__()
-        except Exception as ex:  # pragma: no cover
-            print(f"[commander] start failed: {ex}")
-            self._agent = None
-            self._start_error = ex
+            await _connect()
+        except Exception as ex:
+            err = str(ex)
+            # Recoverable: a persisted conversation_id is missing in save_dir.
+            # Retry once with a fresh conversation so the user isn't stuck.
+            if (self.conversation_id is not None and "conversation" in err
+                    and ("not found" in err or "cannot resume" in err
+                         or "resume" in err)):
+                self.conversation_id = None
+                self._cm = None
+                try:
+                    await _connect()
+                except Exception as ex2:
+                    print(f"[commander] start failed: {ex2}")
+                    self._agent = None
+                    self._start_error = ex2
+            else:
+                print(f"[commander] start failed: {ex}")
+                self._agent = None
+                self._start_error = ex
 
     async def stop(self):
         if self._cm:

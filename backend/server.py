@@ -98,6 +98,12 @@ async def interrupt_egg(egg_id: str = Query(...)):
     return {"ok": True, "eggId": egg_id, "busy": egg.busy}
 
 
+@app.get("/api/sessions")
+async def list_sessions():
+    """List all saved canvas sessions (newest first)."""
+    return {"sessions": Canvas.list_sessions()}
+
+
 async def _stream_events(ws: WebSocket, agen):
     """Translate orchestration events into WS messages.
 
@@ -140,6 +146,9 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
                 {"type": "system", "eggId": e.id,
                  "text": "（已根据目标由 LLM 生成该蛋的提示词）"}
             )
+        # The generate opened a NEW dated session; refresh the picker + mark active.
+        await ws.send_json({"type": "sessions", "sessions": Canvas.list_sessions()})
+        await ws.send_json({"type": "session", "sessionId": canvas.session_id})
 
     elif t == "addEgg":
         await canvas.add_egg(msg.get("title", "新蛋"), msg.get("prompt", ""))
@@ -172,6 +181,7 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
                 try:
                     await ws.send_json({"type": "status", "eggId": eid, "status": "idle"})
                     await ws.send_json({"type": "done", "eggId": eid})
+                    canvas.save()
                 except Exception:  # pragma: no cover
                     pass
 
@@ -183,6 +193,41 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
         egg = canvas.eggs.get(msg.get("eggId"))
         if egg:
             egg.interrupt()
+
+    elif t == "listSessions":
+        await ws.send_json({"type": "sessions", "sessions": Canvas.list_sessions()})
+
+    elif t == "loadSession":
+        sid = msg.get("sessionId")
+        if sid:
+            try:
+                view = await canvas.load(sid)
+                await ws.send_json({"type": "eggs", **view})
+                # Replay each egg's (and the commander's) stored transcript so the
+                # UI shows the prior conversation. The SDK resumes the LLM session
+                # on the next message via the saved conversation_id + save_dir.
+                for e in canvas.eggs.values():
+                    await ws.send_json({"type": "history", "eggId": e.id,
+                                        "transcript": e.transcript})
+                await ws.send_json({"type": "history", "eggId": "commander",
+                                    "transcript": canvas.commander.transcript})
+            except Exception as ex:
+                await ws.send_json({"type": "error", "message": f"load failed: {ex}"})
+
+    elif t == "newSession":
+        # Persist the current session (if any) then open a fresh empty session.
+        try:
+            canvas.save()
+        except Exception:
+            pass
+        for e in list(canvas.eggs.values()):
+            await e.stop()
+        canvas.eggs.clear()
+        canvas.edges.clear()
+        sid = canvas._new_session()
+        await ws.send_json({"type": "eggs", **canvas.view()})
+        await ws.send_json({"type": "sessions", "sessions": Canvas.list_sessions()})
+        await ws.send_json({"type": "session", "sessionId": sid})
 
     elif t == "compress":
         egg = canvas.eggs.get(msg["eggId"])
@@ -203,6 +248,7 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
             finally:
                 try:
                     await ws.send_json({"type": "status", "eggId": egg.id, "status": "idle"})
+                    canvas.save()
                 except Exception:  # pragma: no cover
                     pass
 
@@ -239,9 +285,17 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
             [msg.get("target")] if msg.get("target") else []
         )
         await _stream_events(ws, canvas.commander_run(msg.get("text", ""), targets))
+        try:
+            canvas.save()
+        except Exception:
+            pass
 
     elif t == "run":
         await _stream_events(ws, canvas.run_selected(msg.get("targets") or []))
+        try:
+            canvas.save()   # persist any recovered conversation ids, etc.
+        except Exception:
+            pass
 
     elif t == "setHistoryMode":
         mode = msg.get("mode")

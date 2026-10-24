@@ -48,6 +48,13 @@ class _LLMBox:
 _LLM_BOX = _LLMBox()
 
 
+# Per-turn safety timeout. If a model turn (e.g. a hung tool call / a stream that
+# never ends) doesn't finish, abandon it so the box lock is released and the egg
+# returns to 空闲 instead of being stuck 运行中 forever. Generous by default;
+# override with EGG_TURN_TIMEOUT (seconds).
+_TURN_TIMEOUT = float(os.environ.get("EGG_TURN_TIMEOUT", "900"))
+
+
 # The SDK's local OpenAI harness DISCARDS the model's `reasoning_content`, so
 # for local backends we capture the thinking directly via a streaming call and
 # record it as 💭 thoughts. `supported` is auto-detected (None=unknown) so we
@@ -80,7 +87,8 @@ def _chunk_to_text(chunk):
 
 
 class EggAgent:
-    def __init__(self, id, title, prompt, type_, position, subagents=None, parent=None):
+    def __init__(self, id, title, prompt, type_, position, subagents=None, parent=None,
+                 session_dir=None, conversation_id=None):
         self.id = id
         self.title = title
         self.prompt = prompt
@@ -88,9 +96,21 @@ class EggAgent:
         self.x, self.y = position
         self.subagents = subagents or []
         self.parent = parent
-        # Top-level eggs (idea eggs) live directly under WORKTREE_ROOT; sub-eggs
-        # nest inside their parent's directory as independent sub-directories.
-        self.worktree: Path = (WORKTREE_ROOT / parent / id) if parent else (WORKTREE_ROOT / id)
+        # Every egg belongs to a Canvas session; its code worktree and the SDK's
+        # conversation persistence (save_dir) live under that session directory so
+        # a whole idea project is self-contained under sessions/<timestamp>/.
+        self.session_dir = Path(session_dir) if session_dir else WORKTREE_ROOT
+        # Per-egg conversation id. None means "not yet established": on first
+        # connect we DON'T pass it so the SDK creates a fresh conversation and
+        # assigns an id (read back via self._agent.conversation_id). After that we
+        # persist + pass this id so the SDK RESUMES the same session across turns
+        # and restarts. Passing an id absent from save_dir makes the SDK raise
+        # "conversation ... not found ... cannot resume".
+        self.conversation_id = conversation_id
+        # Top-level eggs (idea eggs) live directly under the session worktrees
+        # dir; sub-eggs nest inside their parent's directory as sub-directories.
+        self.worktree: Path = (self.session_dir / "worktrees" / parent / id
+                               if parent else self.session_dir / "worktrees" / id)
         self.worktree.mkdir(parents=True, exist_ok=True)
         # touch a placeholder file so "review code" has something to show
         scope = f" (sub-egg of `{parent}`)" if parent else ""
@@ -121,6 +141,7 @@ class EggAgent:
         return {
             "id": self.id, "title": self.title, "prompt": self.prompt,
             "type": self.type, "x": self.x, "y": self.y, "parent": self.parent,
+            "conversation_id": self.conversation_id,
         }
 
     # ---- SDK lifecycle ----
@@ -152,7 +173,7 @@ class EggAgent:
             post_tool_call_hooks=[_tr],
         )
 
-    def _config(self):
+    def _config(self, resume=True):
         si = (
             f"You are an autonomous LLM module living inside an 'idea egg' named "
             f"'{self.title}'.\nYour module responsibility (prompt): {self.prompt}\n"
@@ -177,21 +198,67 @@ class EggAgent:
             si,
             workspaces=[str(self.worktree)],
             app_data_dir=str(self.worktree / "agent_data"),
+            save_dir=str(self.session_dir / "agent_data"),
+            # When resuming we pass the stable per-egg id so the SDK restores the
+            # full LLM session; when it's gone we omit it (fresh conversation).
+            conversation_id=(self.conversation_id if resume else None),
             capabilities=caps,
             policies=[policy.allow_all()],
             subagents=None,
             hook_runner=self._make_hook_runner(),
         )
 
+    def _sync_conv_id(self):
+        """Adopt the runtime-assigned conversation id (available only after the
+        first message) so a recovered/fresh conversation resumes correctly on the
+        next app start instead of retrying a stale id forever."""
+        try:
+            cid = self._agent.conversation_id if self._agent else None
+        except Exception:
+            cid = None
+        if cid and cid != self.conversation_id:
+            self.conversation_id = cid
+
+    async def _open_agent(self, resume=True):
+        """Build + enter an Agent, cleaning up if entering fails."""
+        with quiet_sdk_start():
+            cm = Agent(self._config(resume=resume))
+            try:
+                agent = await cm.__aenter__()
+                return cm, agent
+            except Exception:
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                raise
+
     async def start(self):
         if not SDK_OK:
             return
         try:
-            with quiet_sdk_start():
-                self._cm = Agent(self._config())
-                self._agent = await self._cm.__aenter__()
-        except Exception as ex:  # pragma: no cover
+            self._cm, self._agent = await self._open_agent(resume=True)
+            return
+        except Exception as ex:
+            # A stale conversation id — the session's agent_data was cleared, or
+            # the egg is resumed under a fresh session dir — makes the SDK refuse
+            # to resume ("... not found ... (cannot resume)"). Recover by starting
+            # a FRESH conversation instead of leaving the egg permanently offline.
+            if "cannot resume" in str(ex) or "not found" in str(ex).lower():
+                try:
+                    self._cm, self._agent = await self._open_agent(resume=False)
+                    try:
+                        self.conversation_id = (self._agent.conversation_id
+                                                or self.conversation_id)
+                    except Exception:
+                        self.conversation_id = uuid.uuid4().hex
+                    print(f"[egg {self.id}] stale conversation -> started fresh "
+                          f"(id={self.conversation_id})")
+                    return
+                except Exception as ex2:
+                    ex = ex2
             print(f"[egg {self.id}] agent start failed: {ex}")
+            self._cm = None
             self._agent = None
             self._start_error = ex
 
@@ -213,6 +280,29 @@ class EggAgent:
             return False
         self._start_attempted = True
         await self.start()
+        # If the SDK created a brand-new conversation (we did NOT pass a
+        # conversation_id to resume), capture the id it assigned so later turns /
+        # process restarts resume THIS session instead of failing with
+        # "conversation ... not found ... cannot resume".
+        if self.conversation_id is None and self._agent is not None:
+            cid = getattr(self._agent, "conversation_id", None)
+            if cid:
+                self.conversation_id = cid
+        # Recover from a missing persisted conversation: if resume failed because
+        # the conversation_id isn't in save_dir, drop it and reconnect so the SDK
+        # starts a FRESH conversation instead of hard-failing every turn.
+        if self._agent is None and self._start_error is not None and self.conversation_id is not None:
+            err = str(self._start_error)
+            if "conversation" in err and ("not found" in err or "cannot resume" in err
+                                          or "resume" in err):
+                self.conversation_id = None
+                self._start_attempted = False
+                self._start_error = None
+                await self.start()
+                if self.conversation_id is None and self._agent is not None:
+                    cid = getattr(self._agent, "conversation_id", None)
+                    if cid:
+                        self.conversation_id = cid
         if self._agent is not None and not self._recorded_init:
             self._recorded_init = True
             # Capture the FULL system prompt and the tool set into the trace so
@@ -230,7 +320,14 @@ class EggAgent:
     def _offline_msg(self, action):
         msg = f"⚠ 该蛋的 LLM 未连接，无法{action}。"
         if self._start_error:
-            msg += f"\n原因：{self._start_error}"
+            err = str(self._start_error)
+            msg += f"\n原因：{err}"
+            # A recoverable session-state problem (persisted conversation_id missing
+            # in save_dir) should NOT be misreported as a backend/model outage.
+            if "conversation" in err and ("not found" in err or "cannot resume" in err
+                                          or "resume" in err):
+                msg += "\n（会话状态文件丢失；下次对话将自动以新会话开始。）"
+                return msg
         msg += "\n请确认 IDEA_BACKEND 与本地/云端模型可用（openai 后端需 :9000 服务在跑）。"
         return msg
 
@@ -401,25 +498,35 @@ class EggAgent:
                 if (BACKEND == "openai" and _REASONING["enabled"]
                         and _REASONING["supported"] is not False):
                     async with _LLM_BOX.lock:      # one model request at a time
-                        async for rc in self._capture_reasoning(text):
-                            self._record_thought(rc)
-                            yield f"💭 {rc}"
+                        try:
+                            async with asyncio.timeout(_TURN_TIMEOUT):
+                                async for rc in self._capture_reasoning(text):
+                                    self._record_thought(rc)
+                                    yield f"💭 {rc}"
+                        except asyncio.TimeoutError:
+                            yield f"\n⚠ 思考超时（{_TURN_TIMEOUT:g}s），已停止。\n"
+                            return
                 for attempt in range(1, _LLM_BOX.max_attempts + 1):
                     try:
                         async with _LLM_BOX.lock:      # one chat at a time
                             chat = self._chat_once(text)
                             try:
-                                async for t in chat:
-                                    yield t
+                                async with asyncio.timeout(_TURN_TIMEOUT):
+                                    async for t in chat:
+                                        yield t
                             finally:
                                 # stop the model call + free locks on interrupt
                                 try:
                                     await chat.aclose()
                                 except Exception:  # pragma: no cover
                                     pass
+                        self._sync_conv_id()   # persist the real conversation id
                         return
                     except asyncio.CancelledError:
                         raise
+                    except asyncio.TimeoutError:
+                        yield f"\n⚠ 本次运行超时（{_TURN_TIMEOUT:g}s），已停止。\n"
+                        return
                     except Exception as ex:
                         if attempt >= _LLM_BOX.max_attempts:
                             yield f"\n⚠ 请求多次失败，已停止：{ex}\n"

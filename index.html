@@ -135,6 +135,11 @@
 <body>
   <div id="topbar">
     <span class="logo">◓ IdeaCanvas</span>
+    <label class="histmode" title="选择已保存的画布会话">画布
+      <select id="sessionSel"><option value="">（新画布）</option></select>
+    </label>
+    <button id="loadBtn">📂 加载</button>
+    <button id="newBtn">🆕 新建</button>
     <input id="goal" placeholder="输入目标，例如：做一个天气查询机器人" />
     <button class="primary" id="genBtn">⚡ 生成 idea 蛋</button>
     <button id="addBtn">＋ 手动加蛋</button>
@@ -228,7 +233,7 @@ function edgePath(x1,y1,x2,y2){ const c=Math.max(40,Math.abs(x2-x1)/2); return `
 let ws;
 function connect(){
   ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = ()=>{ $('#status').textContent='已连接'; ws.send(JSON.stringify({type:'sync'})); };
+  ws.onopen = ()=>{ $('#status').textContent='已连接'; send({type:'sync'}); send({type:'listSessions'}); };
   ws.onclose = ()=>{ $('#status').textContent='断开，重连中…'; setTimeout(connect, 1500); };
   ws.onmessage = ev => handle(JSON.parse(ev.data));
 }
@@ -236,18 +241,97 @@ function send(obj){ if(ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }
 
 function handle(m){
   switch(m.type){
-    case 'eggs': syncGraph(m.eggs, m.edges); if(m.history_mode) $('#histMode').value=m.history_mode; if(m.reasoning) $('#reasonChk').checked=!!m.reasoning.enabled; break;
+    case 'eggs': syncGraph(m.eggs, m.edges); if(m.history_mode) $('#histMode').value=m.history_mode; if(m.reasoning) $('#reasonChk').checked=!!m.reasoning.enabled; restoreGenBtn(); break;
     case 'historyMode': $('#histMode').value=m.mode; break;
     case 'reasoning': $('#reasonChk').checked=!!m.enabled; break;
     case 'token': appendToken(m.eggId, m.text); if(traceKey===m.eggId) refreshTraceThrottled(); break;
     case 'msg': { const e=state.eggs[m.eggId]; if(e) pushMsg(e, m.role||'user', m.text); break; }
     case 'status': { const e=state.eggs[m.eggId]; if(e) setEggStatus(e, m.status); break; }
-    case 'done': { delete activeStream[m.eggId]; const e=state.eggs[m.eggId]; if(e) setEggStatus(e,'idle'); if(traceKey===m.eggId) fetchTrace(m.eggId); break; }
+    case 'done': {
+      delete activeStream[m.eggId];
+      const e=state.eggs[m.eggId];
+      if(e) setEggStatus(e,'idle');
+      if(m.eggId==='commander'){
+        // A finished run/plan must never leave an egg stuck 运行中/计划中.
+        for(const id in state.eggs){ const eg=state.eggs[id]; if(eg.running||eg.planned) setEggStatus(eg,'idle'); }
+      }
+      if(traceKey===m.eggId) fetchTrace(m.eggId);
+      break;
+    }
     case 'system': { const e=state.eggs[m.eggId]; if(e) pushMsg(e,'system',m.text); if(traceKey===m.eggId) fetchTrace(m.eggId); break; }
     case 'compressed': { const e=state.eggs[m.eggId]; if(e){ e.messages=[]; pushMsg(e,'system',m.summary); setEggStatus(e,'idle'); } break; }
-    case 'error': toast('错误: '+m.message); break;
+    case 'error': toast('错误: '+m.message); restoreGenBtn(); break;
+    case 'sessions': fillSessionSel(m.sessions); break;
+    case 'history': applyHistory(m.eggId, m.transcript); break;
+    case 'session': $('#sessionSel').value = m.sessionId || ''; break;
   }
 }
+
+/* Re-enable the generate button once generation completes (or errors). No-op if
+   it wasn't disabled (e.g. an 'eggs' message from loading a session). */
+function restoreGenBtn(){
+  const btn=$('#genBtn');
+  if(btn.disabled){
+    btn.disabled=false;
+    btn.textContent = btn.dataset.old || '⚡ 生成 idea 蛋';
+  }
+}
+
+/* ---------- session (canvas) persistence UI ---------- */
+function fillSessionSel(sessions){
+  const sel = $('#sessionSel');
+  sel.innerHTML = '<option value="">（新画布）</option>';
+  for(const s of (sessions||[])){
+    const label = (s.label ? s.label + ' · ' : '') + s.created_at + ' · ' + (s.eggs||0) + '蛋';
+    const o = document.createElement('option');
+    o.value = s.id; o.textContent = label;
+    sel.appendChild(o);
+  }
+}
+function transcriptToContent(t){
+  if(t.kind === 'text') return t.text || '';
+  if(t.kind === 'thought') return '💭 ' + (t.text || '');
+  if(t.kind === 'tool_call') return '🔧 调用工具：' + (t.name || '');
+  if(t.kind === 'tool_result') return '↳ 工具结果：' + (t.result || t.error || '');
+  if(t.kind === 'system_prompt' || t.kind === 'tools' || t.kind === 'status' || t.kind === 'plan')
+    return t.text || '';
+  return t.text || '';
+}
+function historyRole(t){ return t.role === 'tool' ? 'system' : t.role; }
+function applyHistory(eggId, transcript){
+  if(!transcript || !transcript.length) return;
+  if(eggId === 'commander'){
+    const body = $('#cmdBody');
+    for(const t of transcript){
+      const role = historyRole(t), c = transcriptToContent(t);
+      if(!c) continue;
+      const d = document.createElement('div');
+      d.className = 'c-msg';
+      const who = document.createElement('b');
+      who.textContent = (role==='user'?'你：':(role==='assistant'?'总指挥：':'系统：'));
+      d.appendChild(who); d.appendChild(document.createTextNode(c));
+      body.appendChild(d);
+    }
+    body.scrollTop = body.scrollHeight;
+    return;
+  }
+  const e = state.eggs[eggId];
+  if(!e) return;
+  e.messages = [];
+  for(const t of transcript){
+    const c = transcriptToContent(t);
+    if(c) e.messages.push({role: historyRole(t), content: c});
+  }
+  renderMsgs(e);
+}
+$('#loadBtn').addEventListener('click', ()=>{
+  const id = $('#sessionSel').value;
+  if(!id){ toast('请选择要加载的画布会话'); return; }
+  send({type:'loadSession', sessionId: id});
+});
+$('#newBtn').addEventListener('click', ()=>{
+  send({type:'newSession'});
+});
 
 /* ---------- rendering ---------- */
 /* The chat shows ONLY user + assistant (thinking/tool calls live in the 轨迹). */
@@ -496,7 +580,15 @@ $('#modalX').addEventListener('click', ()=> $('#modal').classList.remove('open')
 $('#modal').addEventListener('click', e=>{ if(e.target.id==='modal') $('#modal').classList.remove('open'); });
 
 /* ---------- topbar actions ---------- */
-$('#genBtn').addEventListener('click', ()=>{ const g=$('#goal').value.trim()||'构建一个智能应用'; send({type:'generate', goal:g}); });
+$('#genBtn').addEventListener('click', ()=>{
+  const g=$('#goal').value.trim()||'构建一个智能应用';
+  const btn=$('#genBtn');
+  if(btn.disabled) return;           // 已在生成中，避免重复点击
+  btn.dataset.old = btn.textContent;
+  btn.textContent='运行中…';
+  btn.disabled=true;
+  send({type:'generate', goal:g});
+});
 $('#addBtn').addEventListener('click', ()=> send({type:'addEgg', title:'新蛋'}));
 $('#combineBtn').addEventListener('click', ()=>{
   const ids=Object.values(state.eggs).filter(e=>e.selected).map(e=>e.id);

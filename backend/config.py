@@ -25,6 +25,12 @@ WORKSPACE = Path(__file__).resolve().parent.parent
 WORKTREE_ROOT = WORKSPACE / "worktrees"
 WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
 
+# Each Canvas "session" (one idea project) is a self-contained dated directory
+# holding canvas.json, agent_data/ (SDK conversation persistence) and the eggs'
+# worktrees/. Listing this dir == the user's saved idea sessions.
+SESSIONS_DIR = WORKSPACE / "sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
 # ---- Backend selection ----
 # Default to the local OpenAI-compatible server (no .litertlm file required).
 BACKEND = os.environ.get("IDEA_BACKEND", "openai").lower()
@@ -102,6 +108,7 @@ def build_agent_config(
     conversation_id=None,
     workspaces=None,
     app_data_dir=None,
+    save_dir=None,
     hook_runner=None,
 ):
     """Return an AgentConfig for the selected backend.
@@ -128,6 +135,8 @@ def build_agent_config(
         base["workspaces"] = workspaces
     if app_data_dir:
         base["app_data_dir"] = app_data_dir
+    if save_dir:
+        base["save_dir"] = save_dir
     if hook_runner is not None:
         base["hook_runner"] = hook_runner
 
@@ -168,7 +177,7 @@ def build_agent_config(
         return cls(**base)
     except TypeError:
         # Drop optional keys the concrete class may not accept, then retry.
-        for k in ("workspaces", "app_data_dir", "subagents",
+        for k in ("workspaces", "app_data_dir", "save_dir", "subagents",
                   "response_schema", "conversation_id", "compaction_config",
                   "hook_runner"):
             base.pop(k, None)
