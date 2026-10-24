@@ -10,10 +10,14 @@ import asyncio
 import datetime
 import json
 import os
+import time
+import uuid
 from pathlib import Path
 
 from .config import (WORKTREE_ROOT, build_agent_config, BACKEND, quiet_sdk_start,
-                     OPENAI_MODEL, OPENAI_BASE_URL)
+                     OPENAI_MODEL, OPENAI_BASE_URL, is_corrupt_conversation_error)
+from .reasoning import (set_reasoning_capture, reasoning_capture_state,
+                        reasoning_enabled, capture_reasoning)
 
 try:  # pragma: no cover - depends on installed SDK
     from google.antigravity import Agent, CapabilitiesConfig, types
@@ -43,27 +47,36 @@ class _LLMBox:
 _LLM_BOX = _LLMBox()
 
 
+async def _aclose_quiet(cm):
+    """Close an SDK agent context manager in the background, swallowing errors."""
+    try:
+        await cm.__aexit__(None, None, None)
+    except Exception:
+        pass
+
+
 # Per-turn safety timeout. If a model turn (e.g. a hung tool call / a stream that
 # never ends) doesn't finish, abandon it so the box lock is released and the egg
 # returns to 空闲 instead of being stuck 运行中 forever. Generous by default;
 # override with EGG_TURN_TIMEOUT (seconds).
-_TURN_TIMEOUT = float(os.environ.get("EGG_TURN_TIMEOUT", "900"))
+_TURN_TIMEOUT = float(os.environ.get("EGG_TURN_TIMEOUT", "300"))
+
+# A turn that goes SILENT (no chunk at all for this long) is stalled — the
+# model/server stopped streaming. Without this watchdog the egg would keep the
+# "运行中" badge for the whole _TURN_TIMEOUT and the panel/trace would look
+# frozen. Abort the turn instead so the egg returns to 空闲 promptly.
+_STALL_TIMEOUT = float(os.environ.get("EGG_STALL_TIMEOUT", "120"))
+
+# The reasoning probe is a throwaway extra call; it must never hold the run
+# hostage for long.
+_REASON_TIMEOUT = float(os.environ.get("EGG_REASON_TIMEOUT", "90"))
 
 
 # The SDK's local OpenAI harness DISCARDS the model's `reasoning_content`, so
 # for local backends we capture the thinking directly via a streaming call and
-# record it as 💭 thoughts. `supported` is auto-detected (None=unknown) so we
-# stop wasting an extra call once we learn the model doesn't reason.
-_REASONING = {"enabled": BACKEND == "openai", "supported": None}
-
-
-def set_reasoning_capture(on):
-    _REASONING["enabled"] = bool(on)
-    _REASONING["supported"] = None  # re-probe when re-enabled
-
-
-def reasoning_capture_state():
-    return {"enabled": _REASONING["enabled"], "supported": _REASONING["supported"]}
+# record it as 💭 thoughts. The shared helpers live in .reasoning so the
+# 总指挥 (Commander) can surface its thinking the same way.
+__all__ = ["set_reasoning_capture", "reasoning_capture_state"]
 
 
 def _chunk_to_text(chunk):
@@ -127,9 +140,27 @@ class EggAgent:
         # The active SDK ChatResponse while a model turn streams, so interrupt()
         # can send halt_request to the backend (not merely close the local reader).
         self._active_resp = None
+        # Whether the CURRENT turn produced a usable assistant payload (text or
+        # a structured tool call). A turn with NEITHER is persisted by the SDK as
+        # an empty assistant message, which makes the model server reject every
+        # later request in this conversation with HTTP 400
+        # ("Assistant message must contain either 'content' or 'tool_calls'!").
+        # We detect that and drop the conversation before it can poison a turn.
+        self._turn_payload = False
         # Chronological conversation trace (user commands, model text/thoughts,
         # system prompt, tool calls/results) — viewable via /api/trace/{egg_id}.
         self.transcript = []
+        # ---- run bookkeeping (read by the commander's monitor loop) ----
+        # When the CURRENT run started (monotonic) / None when idle.
+        self.run_started_at = None
+        # When the transcript last grew — used to detect a SILENT (stuck) run.
+        self.last_activity = time.monotonic()
+        # What the last finished run produced (reply length, duration, …).
+        self.last_completion = None
+        # How many runs this egg has completed (monotonic counter).
+        self.run_seq = 0
+        self._run_mark = 0      # transcript index where the current run started
+        self._run_started = None
 
     # ---- serialization for the frontend ----
     def spec(self):
@@ -173,11 +204,25 @@ class EggAgent:
         si = (
             f"You are an autonomous LLM module living inside an 'idea egg' named "
             f"'{self.title}'.\nYour module responsibility (prompt): {self.prompt}\n"
-            f"Your code workspace is the directory: {self.worktree}\n"
-            f"Implement your module by WRITING AND RUNNING code inside that "
-            f"workspace using the available file/command tools. Create real source "
-            f"files there. Coordinates with connected eggs only when instructed. "
-            f"Be concise and show what you built."
+            f"You have a workspace directory: {self.worktree} "
+            f"(file/command tools are available if you need them).\n"
+            f"BEFORE you start, decide what kind of task this is:\n"
+            f"(A) The task genuinely REQUIRES CODE (implementing a program, "
+            f"algorithm, script, service or tool). Then implement it for real: "
+            f"write actual source files into the workspace and RUN them with the "
+            f"command tools to verify they work. Never fake it — only report what "
+            f"you actually ran and observed.\n"
+            f"(B) The task is a GENERAL (non-programming) task — e.g. writing "
+            f"copy/text, analysis, research summary, planning, brainstorming, "
+            f"data organization, answering a question. Then do NOT treat it as a "
+            f"programming task: complete it directly in your reply, and do not "
+            f"invent a program just to look productive. Saving genuinely useful "
+            f"artifacts (notes, documents, data) into the workspace is allowed "
+            f"but optional.\n"
+            f"Either way, the deliverable is your final reply: state clearly what "
+            f"you produced. If you wrote code, list the files and how to run them; "
+            f"if you did not, present the content/result directly. "
+            f"Coordinates with connected eggs only when instructed. Be concise."
         )
         # Only keep the minimal SWE toolset (write/run code) — drop the default
         # web/image/subagent tools that bloat the context and are unused here.
@@ -328,8 +373,18 @@ class EggAgent:
         return msg
 
     # ---- conversation trace ----
+    @property
+    def transcript_len(self):
+        """Total character length of the conversation trace.
+
+        The commander's monitor compares this across ticks to answer
+        "会话有没有变长" (is the egg still making progress?).
+        """
+        return sum(len(r.get("text") or "") for r in self.transcript)
+
     def _record(self, role, kind, text=None, name=None, args=None,
                 result=None, error=None):
+        self.last_activity = time.monotonic()
         self.transcript.append({
             "ts": datetime.datetime.now().isoformat(timespec="milliseconds"),
             "role": role,
@@ -360,12 +415,17 @@ class EggAgent:
 
     def _record_chunk(self, chunk):
         if isinstance(chunk, str):
+            self._turn_payload = True
             self._record_text(chunk)
         elif isinstance(chunk, types.Text):
+            self._turn_payload = True
             self._record_text(chunk.text)
         elif isinstance(chunk, types.Thought):
             self._record_thought(chunk.text)
         elif isinstance(chunk, types.ToolCall):
+            # A structured tool call IS a valid assistant payload (the API
+            # accepts an assistant message that carries tool_calls).
+            self._turn_payload = True
             self._record("assistant", "tool_call", name=chunk.name,
                          args=chunk.args)
         elif isinstance(chunk, types.ToolResult):
@@ -430,51 +490,9 @@ class EggAgent:
 
         The SDK's local OpenAI harness drops reasoning, so for local backends we
         stream a completion straight to the server to surface the 💭 thinking.
-        Sets ``_REASONING['supported']`` so we stop re-calling if the model
-        never reasons.
         """
-        if not (OPENAI_MODEL and OPENAI_BASE_URL):
-            return
-        import httpx  # available with the stack; imported lazily to stay safe
-        payload = {
-            "model": OPENAI_MODEL,
-            "stream": True,
-            "messages": [
-                {"role": "system", "content": self._si},
-                {"role": "user", "content": text},
-            ],
-        }
-        headers = {"Content-Type": "application/json"}
-        key = os.environ.get("OPENAI_API_KEY")
-        if key:
-            headers["Authorization"] = f"Bearer {key}"
-        url = OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
-        got = False
-        try:
-            async with httpx.AsyncClient(timeout=None) as cli:
-                async with cli.stream("POST", url, json=payload, headers=headers) as r:
-                    async for line in r.aiter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line[len("data:"):].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(data)
-                        except Exception:
-                            continue
-                        for ch in obj.get("choices", []):
-                            d = ch.get("delta") or {}
-                            rc = d.get("reasoning_content") or d.get("reasoning")
-                            if rc:
-                                got = True
-                                yield rc
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return  # best-effort: never break the actual run
-        finally:
-            _REASONING["supported"] = got
+        async for rc in capture_reasoning(self._si, text):
+            yield rc
 
     async def _heal_conversation(self, err):
         """Reset a corrupt/invalid SDK conversation so the next chat() starts fresh.
@@ -490,17 +508,20 @@ class EggAgent:
         (which otherwise leaves it stuck "运行中" with an empty box).
         """
         e = str(err)
-        if not ("must contain either" in e or "invalid_request" in e
-                or "cannot resume" in e or "not found" in e.lower()):
+        if not is_corrupt_conversation_error(e):
             return False
-        try:
-            await self.stop()
-        except Exception:
-            pass
+        # Close the OLD session in the BACKGROUND: `Agent.__aexit__` tears down
+        # the harness conversation and can BLOCK for a while. Doing it inline
+        # would hold the egg's lock (and the WS event stream) hostage — the egg
+        # would sit in "运行中" with no output. Detach it and let it finish on
+        # its own task.
+        old_cm = self._cm
+        self._cm = None
+        self._agent = None
         self.conversation_id = None
         self._start_attempted = False
-        self._agent = None
-        self._cm = None
+        if old_cm is not None:
+            asyncio.ensure_future(_aclose_quiet(old_cm))
         try:
             self._cm, self._agent = await self._open_agent(resume=False)
             if self._agent is not None:
@@ -530,6 +551,11 @@ class EggAgent:
         # waiting for the box lock — not only during the active model stream.
         self.busy = True
         self._task = asyncio.current_task()
+        # Remember where this run's transcript starts so the completion facts
+        # (reply length) can be computed when it finishes.
+        self._run_mark = len(self.transcript)
+        self._run_started = time.monotonic()
+        self.run_started_at = self._run_started
         try:
             if not await self._ensure_started():
                 msg = self._offline_msg("执行命令")
@@ -539,29 +565,76 @@ class EggAgent:
             async with self._lock:
                 # Surface the model's 💭 thinking first (local backends drop it in
                 # the SDK harness, so we capture reasoning_content directly).
-                if (BACKEND == "openai" and _REASONING["enabled"]
-                        and _REASONING["supported"] is not False):
+                if (BACKEND == "openai" and reasoning_enabled()):
                     try:
-                        async with asyncio.timeout(_TURN_TIMEOUT):
+                        async with asyncio.timeout(_REASON_TIMEOUT):
                             async for rc in self._capture_reasoning(text):
                                 self._record_thought(rc)
                                 yield f"💭 {rc}"
                     except asyncio.TimeoutError:
-                        yield f"\n⚠ 思考超时（{_TURN_TIMEOUT:g}s），已停止。\n"
-                        return
+                        yield f"\n⚠ 思考超时（{_REASON_TIMEOUT:g}s），已跳过。\n"
                 for attempt in range(1, _LLM_BOX.max_attempts + 1):
                     try:
+                        self._turn_payload = False
                         chat = self._chat_once(text, context=context)
+                        got_text = False
                         try:
-                            async with asyncio.timeout(_TURN_TIMEOUT):
-                                async for t in chat:
-                                    yield t
+                            # Stream with a STALL watchdog: if no chunk arrives
+                            # for _STALL_TIMEOUT the model/server has gone quiet
+                            # (often a truncated/aborted upstream turn). Abort so
+                            # the egg leaves "运行中" and the panel/trace stop
+                            # looking frozen.
+                            agen = chat.__aiter__()
+                            while True:
+                                try:
+                                    t = await asyncio.wait_for(
+                                        agen.__anext__(),
+                                        timeout=_STALL_TIMEOUT)
+                                except StopAsyncIteration:
+                                    break
+                                except asyncio.TimeoutError:
+                                    yield (f"\n⚠ 模型流静默超过 {_STALL_TIMEOUT:g}s，"
+                                           f"已中断本轮。\n")
+                                    resp = self._active_resp
+                                    if resp is not None:
+                                        try:
+                                            await resp.cancel()
+                                        except Exception:
+                                            pass
+                                    break
+                                stripped = t.lstrip()
+                                if not (t.startswith("💭")
+                                        or stripped.startswith("🔧")
+                                        or stripped.startswith("↳")):
+                                    got_text = True
+                                yield t
                         finally:
                             # stop the model call + free locks on interrupt
                             try:
                                 await chat.aclose()
                             except Exception:  # pragma: no cover
                                 pass
+                        if not got_text and not self._turn_payload:
+                            # The turn produced NOTHING (no text, no tool call) —
+                            # the response was truncated or rejected upstream.
+                            # Say so instead of silently "succeeding" with an
+                            # empty answer.
+                            yield ("\n⚠ 本轮没有收到任何模型输出（可能被截断或"
+                                   "上游中断），可重试。\n")
+                        # An EMPTY turn (no text, no structured tool call) is
+                        # persisted by the SDK as an assistant message with
+                        # neither content nor tool_calls — which makes the model
+                        # server reject every later request in this conversation
+                        # (HTTP 400 "Assistant message must contain either
+                        # 'content' or 'tool_calls'!"). Drop the conversation NOW
+                        # so the NEXT command starts from a clean one instead of
+                        # failing forever.
+                        if not self._turn_payload:
+                            print(f"[egg {self.id}] empty model turn -> "
+                                  f"resetting conversation to avoid HTTP 400")
+                            await self._heal_conversation(
+                                "Assistant message must contain either "
+                                "'content' or 'tool_calls'!")
                         self._sync_conv_id()   # persist the real conversation id
                         return
                     except asyncio.CancelledError:
@@ -585,8 +658,31 @@ class EggAgent:
                                f"（{attempt}/{_LLM_BOX.max_attempts}）…\n")
                         await asyncio.sleep(_LLM_BOX.delay)
         finally:
-            self.busy = False
-            self._task = None
+            self._finish_run()
+
+    def _finish_run(self):
+        """Close out a run and publish the facts the commander's monitor reads.
+
+        ``last_completion`` lets the commander tell "this egg finished" from
+        "this egg is still working" without waiting on the run's own task.
+        """
+        self.busy = False
+        self._task = None
+        now = time.monotonic()
+        started = self._run_started or now
+        self.run_started_at = None
+        reply_len = 0
+        for r in self.transcript[self._run_mark:]:
+            if r.get("kind") == "text" and r.get("role") == "assistant":
+                reply_len += len(r.get("text") or "")
+        self.last_completion = {
+            "ts": time.time(),
+            "seq": self.run_seq,
+            "reply_len": reply_len,
+            "transcript_len": self.transcript_len,
+            "duration": round(now - started, 1),
+        }
+        self.run_seq += 1
 
     async def compress(self):
         """Return a concise summary of the egg's conversation (real model)."""

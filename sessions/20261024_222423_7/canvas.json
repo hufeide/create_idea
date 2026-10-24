@@ -1,0 +1,14 @@
+{
+  "session_id": "20261024_222423_7",
+  "created_at": "20261024_222423",
+  "label": null,
+  "history_mode": "brief",
+  "reasoning": {
+    "enabled": true,
+    "supported": false
+  },
+  "eggs": [],
+  "edges": [],
+  "commander": [],
+  "commander_conversation_id": null
+}

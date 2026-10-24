@@ -9,13 +9,16 @@ features:
 import asyncio
 import datetime
 import json
+import os
+import re
 import time
 
 import pydantic
 
 from .egg import EggAgent, reasoning_capture_state
 from .commander import Commander
-from .config import build_agent_config, BACKEND, SESSIONS_DIR
+from .config import (build_agent_config, BACKEND, SESSIONS_DIR,
+                     is_corrupt_conversation_error)
 
 try:  # pragma: no cover
     from google.antigravity import Agent, types, CapabilitiesConfig
@@ -25,6 +28,20 @@ except Exception:  # pragma: no cover
 
 
 _PUMP_DONE = object()   # sentinel: an egg's run generator finished / was cancelled
+
+# ---- commander monitoring / loop tuning -------------------------------------
+# How often the commander polls the eggs while they work (seconds).
+_MONITOR_INTERVAL = float(os.environ.get("COMMANDER_MONITOR_INTERVAL", "3"))
+# A running egg that produced NOTHING for this long is considered stuck; the
+# commander is told so it can re-dispatch / switch eggs / wrap up.
+_EGG_SILENT = float(os.environ.get("COMMANDER_EGG_SILENT", "180"))
+# A running egg that has been going for longer than this is considered overdue.
+_EGG_OVERDUE = float(os.environ.get("COMMANDER_EGG_OVERDUE", "420"))
+# Safety cap on the commander's loop (it normally ends with action="finish").
+_MAX_ROUNDS = int(os.environ.get("COMMANDER_MAX_ROUNDS", "24"))
+# How many consecutive rounds may end without a runnable task before the
+# commander is forced to wrap up (guards against an endless no-op loop).
+_MAX_IDLE = int(os.environ.get("COMMANDER_MAX_IDLE", "3"))
 
 
 async def _pump(agen, q):
@@ -69,6 +86,14 @@ class CommanderTask(pydantic.BaseModel):
     # egg to another — an undelivered box stays with the commander, who
     # arbitrates it.
     deliver: list[str] = []
+    # Who this egg must NOTIFY once it finishes. The commander is ALWAYS
+    # notified (that is the default channel); ids listed here are ADDITIONAL
+    # eggs the commander authorizes to receive this egg's conclusion.
+    notify: list[str] = []
+    # Eggs whose CONCLUSION this task depends on. A task that depends on
+    # another task OF THE SAME ROUND cannot start yet — the commander defers
+    # it to the next round (e.g. a judge that must weigh both debaters).
+    depends_on: list[str] = []
 
 
 class CommanderDecision(pydantic.BaseModel):
@@ -512,19 +537,19 @@ class Canvas:
 
     # ---- commander ----
     async def commander_run(self, text, targets=None):
-        """Commander drives the selected eggs REACTIVELY, one round at a time.
+        """总指挥以【持续循环 + 实时监控】方式驱动选中的子蛋。
 
-        The commander no longer plans the whole serial/parallel graph up front.
-        Every round it looks at what came back and decides the NEXT move:
-          * one task   -> serial: that egg runs alone, its conclusion returns
-          * many tasks -> parallel: several eggs run at once, conclusions return
-                          together
-        Each egg conclusion lands in a "box" (消息盒子) held by the commander.
-        The commander may AUTHORIZE a box to be delivered to another egg — that
-        authorization is the ONLY way two eggs talk to each other; an
-        unauthorized message stays with the commander, who arbitrates it.
-        All commander<->egg traffic carries the user+assistant conversation
-        history (tool calls / thinking are left out for now).
+        The commander is a LOOP, not a one-shot planner:
+
+          * 【持续监控】子蛋在【后台】运行，总指挥因此可以在它们工作期间持续
+            观察：会话有没有变长（delta）、有没有待处理的完成通知、有没有超时
+            或长时间静默 —— 并据此决定下一步动作。
+          * 【主动通知】每只子蛋跑完后会主动通知总指挥（默认通道）；总指挥也
+            可以在任务的 ``notify`` 字段里指定【完成后要通知的其它子蛋】，那
+            只蛋下次运行时就会收到这条完成通知。
+          * 【只有完成才跳出】循环只在决策返回 action="finish"（指令真的完成）
+            时退出。两个兜底阀门防止无限空转：连续 _MAX_IDLE 轮没有可执行的
+            任务、或达到 _MAX_ROUNDS 轮上限。
 
         Yields UI events:
           {"k":"say","text":..}      -> stream into the commander chat
@@ -545,99 +570,206 @@ class Canvas:
             yield {"k": "end"}
             return
 
-        # ---- control mode: reactive, round by round ----
+        # ---- control mode: a monitoring LOOP over the selected eggs ----
         # The commander/egg channels carry user+assistant history only.
         summary = self._commander_context(targets, mode="brief")
         boxes = {}        # egg_id -> {"result": str}   (the 消息盒子)
         channels = {}     # (src, dst) -> [{"role","text"}]  user+assistant only
         cmd_hist = []     # commander-side user+assistant history
         cmd_hist.append({"role": "user", "text": text})
+        inbox = {}        # egg_id -> [完成通知] 等待该蛋下次运行时读取
+        notified = []     # 自上次裁决以来收到的【完成通知】
+        running = {}      # egg_id -> 本次指挥中在后台运行的蛋
+        events = asyncio.Queue()   # 后台产生的 UI 事件
+        watch_base = {}   # egg_id -> 上次裁决时的会话长度（用来算增量）
+        reported = set()  # 已上报过的告警，避免每轮重复刷屏
         all_results = []  # (title, message, reply) for the final recap
         final_summary = ""
-        max_rounds = 12
         round_no = 0
+        idle_rounds = 0
+        bg = []           # 后台任务（裁决 / 子蛋运行），退出时统一清理
+        normal_exit = False   # 总指挥正常收尾（finish）时不该打断还在跑的蛋
 
-        while round_no < max_rounds:
-            round_no += 1
-            decision = await self._commander_decide(
-                text, summary, targets, boxes, channels, cmd_hist, round_no)
-            tasks = [t for t in (decision.get("tasks") or [])
-                     if t.get("egg_id") in self.eggs]
-            if decision.get("action") == "finish" or not tasks:
-                final_summary = decision.get("summary") or ""
-                break
+        try:
+            while True:
+                # ---- 1) 监控：把后台事件转发给 UI ----
+                while not events.empty():
+                    yield events.get_nowait()
 
-            # --- this round's plan (1 task = serial, N tasks = parallel) ---
-            mode = "parallel" if len(tasks) > 1 else "serial"
-            plan_steps = [
-                {"egg_id": t["egg_id"],
-                 "title": self.eggs[t["egg_id"]].title,
-                 "message": t["message"],
-                 "deliver": t.get("deliver") or [],
-                 "mode": mode}
-                for t in tasks
-            ]
-            note = decision.get("note") or ""
-            narration = (f"【第 {round_no} 轮 · {mode}】{note}\n" + "\n".join(
-                f"→ [{s['title']}] {s['message']}"
-                + (f"  (授权转交: {', '.join(s['deliver'])})" if s["deliver"] else "")
-                for s in plan_steps))
-            self.commander._record("system", "plan", text=narration)
-            self.commander._record("assistant", "text", text=narration)
-            cmd_hist.append({"role": "assistant", "text": narration})
-            yield {"k": "say", "text": narration}
-            yield {"k": "plan", "round": round_no, "steps": plan_steps}
-            for s in plan_steps:
-                yield {"k": "status", "egg": s["egg_id"], "status": "planned"}
+                # ---- 2) 监控：收集已经跑完的子蛋（它们会主动通知总指挥） ----
+                finished = [eid for eid, rec in running.items() if rec["done"]]
+                for eid in finished:
+                    rec = running.pop(eid)
+                    self._file_result(rec, boxes, channels, cmd_hist, inbox,
+                                      notified, all_results)
+                    yield {"k": "status", "egg": eid, "status": "idle"}
+                    yield {"k": "end_egg", "egg": eid}
 
-            # ---- execute this round ----
-            # A round with ONE task is serial (that egg alone, then its result
-            # comes back for the commander's next decision); a round with SEVERAL
-            # tasks runs them in parallel and returns all their results at once.
-            # Either way the results are handed back to the commander, who then
-            # decides the next round — no pre-baked multi-step graph.
-            round_results = []
-            if len(plan_steps) == 1:
-                async for ev in self._run_task(plan_steps[0], boxes, channels,
-                                              round_results):
-                    yield ev
-            else:
-                async for ev in self._run_tasks_parallel(plan_steps, boxes,
-                                                         channels, round_results):
-                    yield ev
+                # ---- 3) 监控：会话有没有变长 / 卡住 / 超时 ----
+                watch = self._watch_eggs(targets, watch_base, inbox)
+                for eid, st in watch.items():
+                    if st["delta"] > 0:
+                        # 又在推进了 -> 之前的告警作废
+                        reported.discard((eid, "stuck"))
+                        reported.discard((eid, "overdue"))
+                alerts = self._watch_alerts(watch, reported, cmd_hist)
 
-            # ---- file the results into boxes + channel history ----
-            for r in round_results:
-                eid, msg, reply = r["egg_id"], r["message"], r["reply"]
-                egg = self.eggs.get(eid)
-                if not egg:
+                # ---- 4) 裁决（只有子蛋跑完 / 出现异常时才去问总指挥） ----
+                if finished or alerts or not running:
+                    round_no += 1
+                    if round_no > _MAX_ROUNDS:
+                        # 兜底阀门：轮数用尽，用现有结果收尾（走总结流程）。
+                        print(f"[commander] round cap {_MAX_ROUNDS} reached")
+                        break
+                    # 新的一段总指挥发言：让前端封存上一条消息。
+                    events.put_nowait({"k": "say_break"})
+                    dec = asyncio.create_task(self._commander_decide(
+                        text, summary, targets, boxes, channels, cmd_hist,
+                        round_no, watch=watch, notified=list(notified),
+                        sink=lambda t: events.put_nowait(
+                            {"k": "say", "text": t})))
+                    bg.append(dec)
+                    # 裁决期间 UI 仍然能刷新子蛋的输出（不冻结面板）。
+                    while not dec.done():
+                        ev = await self._next_event(events, 0.5)
+                        if ev is not None:
+                            yield ev
+                    decision = await dec
+                    if dec in bg:
+                        bg.remove(dec)
+                    tasks = [t for t in (decision.get("tasks") or [])
+                             if t.get("egg_id") in self.eggs]
+                    if decision.get("action") == "finish":
+                        # 只有真正完成才跳出循环。
+                        final_summary = decision.get("summary") or ""
+                        normal_exit = True
+                        break
+
+                    started = 0
+                    deferred = []
+                    if tasks:
+                        # --- dependency split: a task that waits for another task
+                        # of THIS round cannot start yet (e.g. a judge that must
+                        # weigh both debaters) — it is deferred to the next round.
+                        runnable, deferred = self._split_by_dependency(tasks, boxes)
+                        if deferred:
+                            names = "、".join(
+                                f"蛋「{self.eggs[d['egg_id']].title}」"
+                                for d in deferred if d["egg_id"] in self.eggs)
+                            cmd_hist.append({
+                                "role": "user",
+                                "text": (f"【调度】{names} 依赖本轮其它蛋的产出，"
+                                         f"已推迟到下一轮执行；请在它们完成后"
+                                         f"再派活。"),
+                            })
+                        tasks = runnable
+                    if tasks:
+                        # --- this round's plan (1 task = serial, N = parallel) ---
+                        mode = "parallel" if len(tasks) > 1 else "serial"
+                        plan_steps = [
+                            {"egg_id": t["egg_id"],
+                             "title": self.eggs[t["egg_id"]].title,
+                             "message": t["message"],
+                             "deliver": t.get("deliver") or [],
+                             "notify": t.get("notify") or [],
+                             "depends_on": t.get("depends_on") or [],
+                             "mode": mode}
+                            for t in tasks
+                        ]
+                        # Deferred tasks are shown too (grey) so the user can see
+                        # WHY they did not run yet.
+                        for d in deferred:
+                            if d["egg_id"] not in self.eggs:
+                                continue
+                            plan_steps.append({
+                                "egg_id": d["egg_id"],
+                                "title": self.eggs[d["egg_id"]].title,
+                                "message": d["message"],
+                                "deliver": d.get("deliver") or [],
+                                "notify": d.get("notify") or [],
+                                "depends_on": d.get("depends_on") or [],
+                                "mode": "deferred",
+                            })
+                        note = decision.get("note") or ""
+                        narration = (f"【第 {round_no} 轮 · {mode}】{note}\n" + "\n".join(
+                            f"→ [{s['title']}] {s['message']}"
+                            + (f"  (授权转交: {', '.join(s['deliver'])})"
+                               if s["deliver"] else "")
+                            + (f"  (完成后通知: {', '.join(s['notify'])})"
+                               if s["notify"] else "")
+                            + (f"  (等待依赖: {', '.join(s['depends_on'])})"
+                               if s["mode"] == "deferred" else "")
+                            for s in plan_steps))
+                        monitor_line = self._fmt_watch_line(watch)
+                        if monitor_line:
+                            narration += "\n📡 监控：" + monitor_line
+                        if alerts:
+                            narration += "\n⚠ " + "\n⚠ ".join(alerts)
+                        self.commander._record("system", "plan", text=narration)
+                        self.commander._record("assistant", "text", text=narration)
+                        cmd_hist.append({"role": "assistant", "text": narration})
+                        # 规划说明另起一条消息（前面是总指挥自己的话）。
+                        yield {"k": "say_break"}
+                        yield {"k": "say", "text": narration}
+                        yield {"k": "plan", "round": round_no, "steps": plan_steps}
+                        for s in plan_steps:
+                            if s["mode"] == "deferred":
+                                continue
+                            yield {"k": "status", "egg": s["egg_id"],
+                                   "status": "planned"}
+                        # 子蛋在【后台】运行，总指挥因此可以持续监控它们。
+                        started = self._start_runs(
+                            [s for s in plan_steps if s["mode"] != "deferred"],
+                            boxes, channels, inbox, events, running, bg)
+                    if started == 0:
+                        if running:
+                            # 总指挥把活派给了一只【正在运行】的蛋 -> 没什么
+                            # 新东西可启动，等它跑完即可（不算空转）。
+                            pass
+                        else:
+                            # 本轮没有可执行的子任务：记一笔并继续循环（不退出），
+                            # 但连续多轮空转会强制收尾，避免无限 loop。
+                            idle_rounds += 1
+                            cmd_hist.append({
+                                "role": "user",
+                                "text": (f"（第 {round_no} 轮没有可执行的子任务。"
+                                         f"请给出下一步指令；若指令确实已完成，"
+                                         f"请用 action='finish' 给出最终总结。）"),
+                            })
+                            if idle_rounds >= _MAX_IDLE:
+                                final_summary = (decision.get("summary")
+                                                 or "（总指挥连续多轮没有可执行的任务，"
+                                                    "指挥结束。）")
+                                break
+                            await asyncio.sleep(_MONITOR_INTERVAL)
+                    else:
+                        idle_rounds = 0
+                    notified.clear()
+                    watch_base = {k: v["len"] for k, v in watch.items()}
                     continue
-                all_results.append((egg.title, msg, reply))
-                boxes[eid] = {"result": reply}
-                # Commander <-> egg channel: the instruction and the reply.
-                ch = channels.setdefault(("commander", eid), [])
-                ch.append({"role": "user", "text": msg})
-                ch.append({"role": "assistant", "text": reply})
-                # Any egg this one was AUTHORIZED to hear from keeps a
-                # peer-to-peer channel too, so the delivered context persists.
-                for src in (r.get("deliver") or []):
-                    pch = channels.setdefault((src, eid), [])
-                    pch.append({"role": "user",
-                                "text": f"来自蛋「{self.eggs[src].title if src in self.eggs else src}」的结论"})
-                    pch.append({"role": "assistant", "text": reply})
-                # Feed the result back to the commander as a user turn so its
-                # next decision is informed by what actually came out.
-                cmd_hist.append({
-                    "role": "user",
-                    "text": f"【子蛋「{egg.title}」完成】\n结论：{reply[:2000]}",
-                })
-                yield {"k": "status", "egg": eid, "status": "idle"}
-                yield {"k": "end_egg", "egg": eid}
+
+                # ---- 5) 还在跑且没有异常：等下一个事件 / 监控 tick ----
+                ev = await self._next_event(events, _MONITOR_INTERVAL)
+                if ev is not None:
+                    yield ev
+        finally:
+            if not normal_exit:
+                # 异常收场（客户端断开 / 被取消 / 兜底阀门触发）：收掉后台任务，
+                # 别让子蛋继续空跑。
+                for t in bg:
+                    if not t.done():
+                        t.cancel()
+                for rec in list(running.values()):
+                    pump = rec.get("pump")
+                    if pump is not None and not pump.done():
+                        pump.cancel()
+            # 正常收尾（action=finish）：仍在工作的子蛋继续跑完，不打断它。
 
         # Recap: let the commander summarize completion (fallback to plain text).
         try:
             if final_summary:
                 self.commander._record("assistant", "text", text=final_summary)
+                yield {"k": "say_break"}
                 yield {"k": "say", "text": final_summary}
             else:
                 res_txt = "\n\n".join(
@@ -654,14 +786,346 @@ class Canvas:
             yield {"k": "say", "text": f"（总结失败：{ex}）"}
         yield {"k": "end"}
 
+    # ---- commander monitoring helpers ----
+    async def _next_event(self, events, timeout):
+        """Wait for the next UI event; None on timeout (a monitor tick)."""
+        try:
+            return await asyncio.wait_for(events.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    def _watch_eggs(self, targets, base=None, inbox=None):
+        """Snapshot every monitored egg for the commander's monitor panel.
+
+        Per egg:
+          running  -> is a model turn in flight right now?
+          len      -> current conversation length (characters)
+          delta    -> how much the conversation GREW since the last decision
+                      (会话有没有变长)
+          silent   -> seconds since the conversation last grew
+          elapsed  -> seconds since the current run started
+          stuck    -> running but silent for too long
+          overdue  -> running for too long
+          pending  -> completion notifications waiting for this egg
+        """
+        now = time.monotonic()
+        base = base or {}
+        inbox = inbox or {}
+        watch = {}
+        # Watch the selected eggs AND any egg that has a pending completion
+        # notification (so a notification never goes unnoticed).
+        watched = list(targets) + [e for e in inbox if e not in targets]
+        for t in watched:
+            e = self.eggs.get(t)
+            if not e:
+                continue
+            cur = e.transcript_len
+            prev = base.get(t, cur)
+            silent = max(0.0, now - (e.last_activity or now))
+            running = bool(e.busy)
+            elapsed = 0.0
+            if running and e.run_started_at:
+                elapsed = max(0.0, now - e.run_started_at)
+            watch[t] = {
+                "id": t,
+                "title": e.title,
+                "running": running,
+                "len": cur,
+                "delta": cur - prev,
+                "silent": round(silent, 1),
+                "elapsed": round(elapsed, 1),
+                "stuck": bool(running and silent > _EGG_SILENT),
+                "overdue": bool(running and elapsed > _EGG_OVERDUE),
+                "pending": len(inbox.get(t) or []),
+                "completed": bool(e.last_completion),
+            }
+        return watch
+
+    def _watch_alerts(self, watch, reported, cmd_hist):
+        """Turn stuck / overdue eggs into alerts for the commander.
+
+        Each alert is recorded once (``reported``) so the commander is not
+        spammed with the same warning every monitor tick.
+        """
+        alerts = []
+        for eid, st in watch.items():
+            if not st["running"]:
+                continue
+            kind = "overdue" if st["overdue"] else ("stuck" if st["stuck"] else None)
+            if not kind:
+                continue
+            key = (eid, kind)
+            if key in reported:
+                continue
+            reported.add(key)
+            what = "运行超时" if kind == "overdue" else "长时间没有新输出"
+            msg = (f"【监控告警】蛋「{st['title']}」{what}"
+                   f"（已运行 {st['elapsed']}s，静默 {st['silent']}s，"
+                   f"会话长度 {st['len']} 字）。")
+            cmd_hist.append({"role": "user", "text": msg})
+            alerts.append(msg)
+        return alerts
+
+    def _fmt_watch_line(self, watch):
+        """One-line monitor summary (shown in the commander's narration)."""
+        if not watch:
+            return ""
+        parts = []
+        for eid, st in watch.items():
+            if st["running"]:
+                growth = f"+{st['delta']}字" if st["delta"] > 0 else "无新增"
+                parts.append(f"{eid} 运行中(会话{st['len']}字，"
+                             f"本轮{growth}，静默{st['silent']}s)")
+            else:
+                pend = f"，待处理通知{st['pending']}条" if st["pending"] else ""
+                parts.append(f"{eid} 空闲(会话{st['len']}字{pend})")
+        return " / ".join(parts)
+
+    def _fmt_watch(self, watch, notified=None):
+        """Render the monitor panel for the commander's decision prompt."""
+        if not watch:
+            return "（没有可监控的子蛋）"
+        lines = []
+        for eid, st in watch.items():
+            if st["delta"] > 0:
+                growth = f"正在变长（+{st['delta']} 字）"
+            elif st["delta"] == 0:
+                growth = "没有变长"
+            else:
+                growth = f"变短（{st['delta']} 字）"
+            state = "运行中" if st["running"] else "空闲"
+            extra = ""
+            if st["elapsed"]:
+                extra += f"，已运行 {st['elapsed']}s"
+            if st["silent"] > 5:
+                extra += f"，静默 {st['silent']}s"
+            if st["pending"]:
+                extra += f"，有 {st['pending']} 条待你处理的完成通知"
+            if st["overdue"]:
+                extra += "，【运行超时】"
+            elif st["stuck"]:
+                extra += "，【长时间无输出】"
+            lines.append(f"- id={eid} 「{st['title']}」{state} | 会话长度 "
+                         f"{st['len']} 字，{growth}{extra}")
+        if notified:
+            lines.append("【待处理的完成通知（子蛋已完成并通知了你）】")
+            for n in notified[-3:]:
+                lines.append(f"- 蛋「{n.get('title')}」的结论："
+                             f"{(n.get('reply') or '')[:300]}")
+        return "\n".join(lines)
+
+    def _role_hint(self, eid):
+        """A short, distinctive keyword for an egg (from its title).
+
+        "正方辩手-运气是资产" -> "正方";  "裁判角色" -> "裁判".  Used to spot
+        that one egg's instruction REFERENCES another egg of the same round.
+        """
+        title = self.eggs[eid].title if eid in self.eggs else str(eid)
+        head = re.split(r"[-—_、,，\s:：()（）]", title)[0] or title
+        return head[:2] if len(head) >= 2 else head
+
+    def _references(self, msg, keyword):
+        """True when ``msg`` talks ABOUT the egg identified by ``keyword``.
+
+        A self-reference ("你是正方辩手，…") does NOT count — the egg is not
+        depending on itself.
+        """
+        if not keyword or keyword not in msg:
+            return False
+        m = re.match(r"\s*你是([^，。：:,\n]{0,14})", msg)
+        if m and keyword in m.group(1):
+            return False      # it is talking about ITSELF
+        return True
+
+    def _resolve_dependencies(self, tasks, boxes=None):
+        """Fill in the dependencies the commander did not declare.
+
+        Small local models often ignore the ``depends_on`` field, but they DO
+        name the other roles in the instruction: the judge says "综合正方与反方
+        双方论证".  Such a task obviously needs that egg's conclusion first,
+        so we infer the edge from the text — otherwise everything runs in
+        parallel and the judge has nothing to judge.
+
+        The same reading also AUTHORIZES the box: an egg that is told to
+        weigh another egg's conclusion must be allowed to read it.
+        """
+        boxes = boxes or {}
+        ids = {t["egg_id"] for t in tasks}
+        deps = {t["egg_id"]: set(t.get("depends_on") or []) for t in tasks}
+        for t in tasks:
+            msg = t.get("message") or ""
+            refs = set()
+            for eid in self.eggs:
+                if eid == t["egg_id"]:
+                    continue
+                if self._references(msg, self._role_hint(eid)):
+                    refs.add(eid)
+            for u in tasks:
+                if u["egg_id"] in refs:
+                    deps[t["egg_id"]].add(u["egg_id"])
+            # 授权读取它被要求参考的、已经有结论的蛋
+            deliver = set(t.get("deliver") or [])
+            for r in refs:
+                if r in boxes and r != t["egg_id"]:
+                    deliver.add(r)
+            t["deliver"] = sorted(deliver)
+        # Break dependency cycles (A waits for B and B waits for A): the one
+        # that comes FIRST in the list keeps its dependency, the other runs.
+        for t in tasks:
+            for u in tasks:
+                if u["egg_id"] == t["egg_id"]:
+                    continue
+                if (u["egg_id"] in deps[t["egg_id"]]
+                        and t["egg_id"] in deps[u["egg_id"]]
+                        and tasks.index(u) > tasks.index(t)):
+                    deps[u["egg_id"]].discard(t["egg_id"])
+        for t in tasks:
+            t["depends_on"] = [d for d in deps[t["egg_id"]] if d in ids]
+        return deps
+
+    def _split_by_dependency(self, tasks, boxes=None):
+        """Split this round's tasks into (runnable, deferred).
+
+        A task whose ``depends_on`` names ANOTHER task of the SAME round has
+        to wait — its dependency has not produced anything yet. Such a task is
+        deferred (it is NOT run this round; the commander picks it up in the
+        next round, once the dependency's conclusion is in its box).
+
+        ``depends_on`` entries that point at an egg with an ALREADY collected
+        conclusion are satisfied and do not defer anything.
+        """
+        self._resolve_dependencies(tasks, boxes)
+        ids = {t["egg_id"] for t in tasks}
+        runnable, deferred = [], []
+        for t in tasks:
+            deps = [d for d in (t.get("depends_on") or [])
+                    if d in ids and d != t["egg_id"]]
+            if deps:
+                deferred.append(t)
+            else:
+                runnable.append(t)
+        # Safety net: if EVERYTHING ended up deferred (a cycle slipped through),
+        # let the first task run so the loop keeps moving.
+        if tasks and not runnable:
+            first = tasks[0]
+            first["depends_on"] = []
+            return [first], tasks[1:]
+        return runnable, deferred
+
+    # ---- background dispatch + completion notification ----
+    def _start_runs(self, plan_steps, boxes, channels, inbox, events, running, bg):
+        """Start this round's eggs in the BACKGROUND.
+
+        Running the eggs in the background is what makes the commander's
+        monitoring possible: the eggs keep streaming while the commander
+        watches their conversation length / silence / duration.
+        """
+        started = 0
+        for step in plan_steps:
+            eid = step["egg_id"]
+            egg = self.eggs.get(eid)
+            if not egg or eid in running:
+                continue
+            events.put_nowait({"k": "instruct", "egg": egg.id,
+                                "text": "🎯 总指挥指令：" + step["message"]})
+            events.put_nowait({"k": "status", "egg": egg.id, "status": "running"})
+            ctx = self._task_context(step, boxes, channels, inbox)
+            q: asyncio.Queue = asyncio.Queue()
+            pump = asyncio.create_task(_pump(egg.run(step["message"], context=ctx), q))
+            rec = {"step": step, "tokens": [], "done": False, "reply": "",
+                   "pump": pump, "egg": egg.id}
+            running[eid] = rec
+            consumer = asyncio.create_task(self._consume_run(eid, q, rec, events))
+            bg.extend([pump, consumer])
+            started += 1
+        return started
+
+    async def _consume_run(self, eid, q, rec, events):
+        """Drain one egg's token stream into the shared UI event queue."""
+        try:
+            while True:
+                item = await q.get()
+                if item is _PUMP_DONE:
+                    rec["reply"] = "".join(rec["tokens"])
+                    rec["done"] = True
+                    return
+                if isinstance(item, tuple) and item and item[0] == "__err__":
+                    txt = f"\n（执行出错：{item[1]}）"
+                    rec["tokens"].append(txt)
+                    await events.put({"k": "egg", "egg": eid, "text": txt})
+                    continue
+                rec["tokens"].append(item)
+                await events.put({"k": "egg", "egg": eid, "text": item})
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # pragma: no cover
+            rec["reply"] = "".join(rec["tokens"])
+            rec["done"] = True
+            await events.put({"k": "egg", "egg": eid,
+                              "text": f"\n（执行出错：{ex}）"})
+
+    def _file_result(self, rec, boxes, channels, cmd_hist, inbox, notified,
+                     all_results):
+        """File a finished egg's conclusion and NOTIFY the right listeners.
+
+        Notifications:
+          * the 总指挥 is ALWAYS notified (its own conversation history gets a
+            "子蛋完成" turn, so the next decision is informed by it);
+          * every egg listed in the task's ``notify`` field receives the
+            conclusion too (it waits in that egg's inbox and is handed over as
+            context the next time that egg runs).
+        """
+        step = rec["step"]
+        eid = step["egg_id"]
+        reply = rec["reply"] or ""
+        egg = self.eggs.get(eid)
+        if not egg:
+            return
+        all_results.append((egg.title, step["message"], reply))
+        boxes[eid] = {"result": reply}
+        # Commander <-> egg channel: the instruction and the reply.
+        ch = channels.setdefault(("commander", eid), [])
+        ch.append({"role": "user", "text": step["message"]})
+        ch.append({"role": "assistant", "text": reply})
+        # Any egg this one was AUTHORIZED to hear from keeps a peer-to-peer
+        # channel too, so the delivered context persists.
+        for src in (step.get("deliver") or []):
+            pch = channels.setdefault((src, eid), [])
+            pch.append({"role": "user",
+                        "text": f"来自蛋「{self.eggs[src].title if src in self.eggs else src}」的结论"})
+            pch.append({"role": "assistant", "text": reply})
+        # ---- 完成通知 ----
+        cmd_hist.append({
+            "role": "user",
+            "text": f"【子蛋「{egg.title}」完成】\n结论：{reply[:2000]}",
+        })
+        notified.append({"egg": eid, "title": egg.title, "reply": reply[:2000]})
+        # 总指挥指定的其它蛋：结论进入它们的收件箱，下次运行时作为上下文带上。
+        for tgt in (step.get("notify") or []):
+            if tgt not in self.eggs or tgt == eid:
+                continue
+            msg = (f"【完成通知：蛋「{egg.title}」已完成并通知你】\n"
+                   f"{reply[:2000]}")
+            inbox.setdefault(tgt, []).append(msg)
+            nch = channels.setdefault((eid, tgt), [])
+            nch.append({"role": "user",
+                        "text": f"来自蛋「{egg.title}」的完成通知"})
+            nch.append({"role": "assistant", "text": reply})
+
     async def _commander_decide(self, text, summary, targets, boxes, channels,
-                                cmd_hist, round_no):
+                                cmd_hist, round_no, watch=None, notified=None,
+                                sink=None):
         """Ask the commander LLM for the NEXT round only (reactive adjudication).
 
         The commander sees:
           * the original instruction
           * the eggs it may drive (id / title / role)
           * the boxes collected so far (each egg's latest conclusion)
+          * the MONITOR panel (``watch``): per egg — running?, conversation
+            length and how much it grew since the last decision, silence
+            duration, elapsed runtime, stuck/overdue flags, pending
+            notifications; plus the completion notifications it received
+            (``notified``)
           * the user+assistant conversation history of its channels
         and answers with either a set of tasks to run NOW (1 = serial, N =
         parallel) or ``action="finish"`` when the instruction is complete.
@@ -670,6 +1134,13 @@ class Canvas:
         this egg to read. That is the only channel through which one egg's
         message reaches another egg; anything not delivered stays with the
         commander for arbitration.
+
+        Each task may name ``notify`` — the eggs that must be told WHEN this
+        egg finishes (the commander is always told).
+
+        ``sink`` is an optional callback that receives the planner's OWN
+        output (its text / thinking / tool calls) so the commander panel can
+        show what the commander actually said — not just the synthesized plan.
         """
         if not SDK_OK:
             return self._fake_commander_decide(text, targets, boxes, round_no)
@@ -689,41 +1160,144 @@ class Canvas:
                 f"{self._fmt_channel(ch)}"
                 for (s, d), ch in channels.items()
             ) or "（暂无通讯记录）"
+            if len(chan_desc) > 4000:
+                chan_desc = "…（更早的通讯记录略去）\n" + chan_desc[-4000:]
+            watch_desc = self._fmt_watch(watch or {}, notified or [])
             sys_instr = types.CustomSystemInstructions(text=(
-                "你是总指挥（Commander），以【逐轮反应式】方式驱动若干子蛋完成用户指令。\n"
-                "重要机制：你【不预先规划完整流程】。每一轮你只决定【下一步】做什么，"
-                "等这一轮的结果回来后，再根据实际结果决定下一轮。\n"
+                "你是总指挥（Commander），以【持续循环 + 实时监控】方式驱动若干子蛋"
+                "完成用户指令。\n"
+                "重要机制：你【不预先规划完整流程】，而是【循环】工作。每一轮你都会收到"
+                "【子蛋实时监控】面板（会话长度/增量、静默时长、已运行时长、超时与静默"
+                "告警、待处理的完成通知），你据此决定【下一步】。\n"
                 "规则：\n"
-                "1) 一次只给本轮的指令。若本轮这些蛋互不依赖，可同时给多个（并行）；"
+                "0) 【先说后决】先用 1-3 句中文说明你此刻的判断与下一步计划"
+                "（这段话会直接显示给用户看），然后再输出结构化 decision。"
+                "说明不超过 3 句，不要写长篇大论，也不要重复已有结论。\n"
+                "1) 你是一个【循环】：只要用户指令还没真正完成，就继续给下一步指令；"
+                "只有当所有子蛋都交付了结论、指令确实完成时，才 action='finish' 并在 "
+                "summary 里给出最终总结。不要因为某轮没有现成任务就提前结束。\n"
+                "2) 每轮先读【子蛋实时监控】：\n"
+                "   · 会话长度/增量：增量>0 说明该蛋还在推进；增量=0 且静默很久说明它"
+                "卡住了 —— 你可以重新给它派活、换一只蛋接手，或直接收尾。\n"
+                "   · 【待处理的完成通知】：子蛋跑完后会主动通知你（你总会收到）。\n"
+                "   · 【监控告警】：运行超时/长时间无输出的蛋需要你裁决。\n"
+                "3) 一次只给本轮的指令。若本轮这些蛋互不依赖，可同时给多个（并行）；"
                 "若需要等某个结果才能定下一步，就只给一个（串行）。\n"
-                "2) 子蛋的结论会回传给你。你据此裁决：还需要谁继续做、还是已经完成。\n"
-                "3) 子蛋之间【默认不能互相通信】。只有你（总指挥）有权让某个结论从一只蛋"
+                "3b) 【时序/依赖】有先后关系的任务必须用 depends_on 声明依赖的蛋 id，"
+                "系统会自动把它推迟到依赖完成后的下一轮执行。例如辩论：正方与反方"
+                "互不依赖，同轮并行；裁判依赖双方，depends_on 写 [\"正方id\", \"反方id\"]，"
+                "它不会在本轮跑（此时双方还没产出，裁判无从裁决），会在双方完成后"
+                "的下一轮才被派活。裁判/评审/汇总/整合/对比这类角色一律都要写"
+                "depends_on，不要和被它依赖的角色放在同一轮。\n"
+                "4) 子蛋之间【默认不能互相通信】。只有你（总指挥）有权让某个结论从一只蛋"
                 "传给另一只蛋：若本轮某只蛋需要参考另一只蛋的结论，在该任务的 deliver "
                 "字段里写上来源蛋的 id，即为【授权转发】；未授权的结论只留在你这里由你裁决。\n"
-                "4) 通讯需要携带上下文：user+assistant 的历史消息即可（暂不需要 tool 和 thinking）。\n"
-                "5) 任务完成时 action='finish'，并在 summary 里给出最终总结；"
+                "5) 每个任务的 notify 字段指定【这只蛋完成后要通知谁】（填子蛋 id 数组，"
+                "可为画布上任一子蛋；你总会收到通知）。例如你希望 A 的结论直接提醒 B "
+                "继续干活，就写 notify=[\"B_id\"]。\n"
+                "6) 只读工具（view_file / list_directory / search_directory / find_file）"
+                "【只能】在下面列出的目录里查看。【不要】去翻其它目录，也不要反复探索"
+                "目录结构；一次最多调用 2 次工具，除非确实需要核实子蛋产出。\n"
+                "7) 通讯需要携带上下文：user+assistant 的历史消息即可（暂不需要 tool 和 thinking）。\n"
+                "8) 任务完成时 action='finish'，并在 summary 里给出最终总结；"
                 "否则 action='dispatch' 给出本轮 tasks。\n"
-                "返回结构化 decision（action + tasks[egg_id, message, deliver] + "
+                "返回结构化 decision（action + "
+                "tasks[egg_id, message, deliver, notify, depends_on] + "
                 "summary + note）。note 用一句中文说明本轮意图。"
             ))
             caps = types.CapabilitiesConfig(
-                enabled_tools=[], enable_subagents=False,
+                # The commander may INSPECT what the eggs produced (read-only
+                # tools) before deciding the next round — and the tool calls
+                # then show up in the 总指挥's 轨迹, like the eggs'.
+                enabled_tools=[
+                    types.BuiltinTools.VIEW_FILE,
+                    types.BuiltinTools.LIST_DIR,
+                    types.BuiltinTools.SEARCH_DIR,
+                    types.BuiltinTools.FIND_FILE,
+                ],
+                enable_subagents=False,
                 agent_behavior=types.AgentBehavior.MINIMAL,
+                # Tool output MUST stay small: the planner once read an 800-line
+                # transcript and blew the agent's context window, which killed
+                # the whole round (the decision silently fell back).
+                tool_output_truncation_config=types.ToolOutputTruncationConfig(
+                    max_tokens=2000),
             )
+            # The commander may READ what the eggs produced — but only inside
+            # the eggs' own worktrees. Without this the read-only tools could
+            # pull in a huge file (e.g. a session log) and blow the agent's
+            # context window, killing the whole round.
+            workspaces = []
+            for t in targets:
+                wt = getattr(self.eggs.get(t), "worktree", None)
+                if wt:
+                    workspaces.append(str(wt))
+            ws_desc = "\n".join(f"- {w}" for w in workspaces) or "（本轮没有可检视的目录）"
             prompt = (
                 f"可选子蛋：\n{target_desc}\n\n"
                 f"已有的结论盒子：\n{boxes_desc}\n\n"
+                f"子蛋实时监控：\n{watch_desc}\n\n"
                 f"通讯历史（user+assistant）：\n{chan_desc}\n\n"
                 f"画布状态：\n{summary}\n\n"
+                f"可检视的目录（只读，仅限这些）：\n{ws_desc}\n\n"
                 f"用户指令：{text}\n\n"
                 f"这是第 {round_no} 轮。请只决定【本轮】的动作。"
             )
-            async with Agent(build_agent_config(
-                system_instructions=sys_instr, capabilities=caps,
-                response_schema=CommanderDecision,
-            )) as planner:
-                resp = await planner.chat(prompt)
-                data = await resp.structured_output()
+            # The planner agent is created fresh每 round, so a corrupt history is
+            # unlikely — but the model can still return an EMPTY turn, which the
+            # server rejects with HTTP 400 "Assistant message must contain either
+            # 'content' or 'tool_calls'!". Retry once with a brand-new agent
+            # before giving up on the round.
+            data = None
+            for attempt in (1, 2):
+                try:
+                    async with Agent(build_agent_config(
+                        system_instructions=sys_instr, capabilities=caps,
+                        response_schema=CommanderDecision,
+                        workspaces=(workspaces or None),
+                    )) as planner:
+                        resp = await planner.chat(prompt)
+                        # Consume the FULL semantic stream (resp.chunks) so the
+                        # commander's 💭 thinking and 🔧 tool calls are recorded
+                        # into its 轨迹 — `async for chunk in resp` would filter
+                        # them out. structured_output() then reads the parsed
+                        # decision from the conversation.
+                        #
+                        # The planner answers in STRUCTURED-OUTPUT mode, i.e. it
+                        # calls the special `finish` tool whose args carry the
+                        # raw JSON. Small local models sometimes fail to make
+                        # the SDK parse that envelope, and structured_output()
+                        # then returns None — so we keep the raw JSON as a
+                        # fallback and parse it ourselves.
+                        raw_json = None
+                        async for chunk in resp.chunks:
+                            self._record_planner_chunk(chunk)
+                            if sink is not None:
+                                shown = self._planner_chunk_text(chunk)
+                                if shown:
+                                    sink(shown)
+                            if isinstance(chunk, types.ToolCall):
+                                nm = getattr(chunk, "name", None)
+                                if nm == "finish" and raw_json is None:
+                                    raw_json = self._finish_payload(chunk)
+                        data = await resp.structured_output()
+                        if data is None and raw_json:
+                            # The SDK could not read the envelope, but the model
+                            # DID produce a valid decision -> use it.
+                            print("[commander-decide] structured_output empty, "
+                                  "using the raw finish payload instead")
+                            data = self._parse_decision_text(raw_json)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    if attempt == 1 and is_corrupt_conversation_error(ex):
+                        print(f"[commander-decide] empty/corrupt turn, "
+                              f"retrying with a fresh agent: {ex}")
+                        continue
+                    raise
+            if data is None:
+                raise RuntimeError("commander decision produced no output")
             if isinstance(data, dict):
                 action = data.get("action") or "dispatch"
                 raw_tasks = data.get("tasks") or []
@@ -740,19 +1314,32 @@ class Canvas:
                 if isinstance(t, dict):
                     eid = t.get("egg_id"); message = t.get("message")
                     deliver = t.get("deliver") or []
+                    notify = t.get("notify") or []
+                    depends = t.get("depends_on") or []
                 else:
                     eid = t.egg_id; message = t.message
                     deliver = getattr(t, "deliver", []) or []
+                    notify = getattr(t, "notify", []) or []
+                    depends = getattr(t, "depends_on", []) or []
                 if eid in valid and message:
                     # only deliver boxes that actually exist
                     out_tasks.append({
                         "egg_id": eid, "message": message,
                         "deliver": [d for d in deliver
                                     if d in boxes and d != eid],
+                        # 完成后通知谁：必须是画布上真实存在的另一只蛋
+                        "notify": [n for n in notify
+                                   if n in self.eggs and n != eid],
+                        # 依赖：只保留画布上真实存在的蛋（自己不能依赖自己）
+                        "depends_on": [d for d in depends
+                                       if d in self.eggs and d != eid],
                     })
-            if action != "dispatch" or not out_tasks:
+            if action != "dispatch":
                 return {"action": "finish", "tasks": [],
                         "summary": summary_txt, "note": note}
+            # NOTE: an empty task list is NOT a reason to finish — the commander
+            # stays in its loop and is asked again (the idle counter in
+            # commander_run is the only guard against a no-op loop).
             return {"action": "dispatch", "tasks": out_tasks,
                     "summary": summary_txt, "note": note}
         except Exception as ex:  # pragma: no cover
@@ -760,14 +1347,153 @@ class Canvas:
             return self._fake_commander_decide(text, targets, boxes, round_no)
 
     def _fake_commander_decide(self, text, targets, boxes, round_no):
-        """No model / planner failed: broadcast once, then finish."""
+        """Fallback when the planner produced nothing usable.
+
+        The model may well be available — what usually fails is the
+        STRUCTURED-OUTPUT envelope (small local models often answer with
+        prose the SDK cannot parse). So we do NOT claim "no model"; we say the
+        decision could not be parsed, and dispatch CONSERVATIVELY: only the
+        first target, so a fallback never invents a wrong parallel structure.
+        """
         if boxes or round_no > 1:
             return {"action": "finish", "tasks": [],
-                    "summary": "（无可用模型，无法继续指挥子蛋。）", "note": ""}
+                    "summary": "（总指挥本轮未能给出可解析的决策，指挥结束。）",
+                    "note": ""}
+        if not targets:
+            return {"action": "finish", "tasks": [],
+                    "summary": "（没有可指挥的子蛋。）", "note": ""}
         return {"action": "dispatch",
-                "tasks": [{"egg_id": t, "message": text, "deliver": []}
-                          for t in targets],
-                "summary": "", "note": ""}
+                "tasks": [{"egg_id": targets[0], "message": text, "deliver": [],
+                           "notify": [], "depends_on": []}],
+                "summary": "", "note": "（总指挥输出无法解析，先派一个目标蛋）"}
+
+    def _planner_chunk_text(self, chunk):
+        """Render a planner chunk as display text for the commander panel.
+
+        The planner runs in STRUCTURED-OUTPUT mode, so its decision travels in
+        a special tool call named ``finish`` whose args carry the raw JSON —
+        that must NOT be shown to the user (they should read the commander's
+        own words, not the JSON envelope). Everything else — its text, its
+        thinking, its real tool calls and their results — is shown.
+        """
+        if isinstance(chunk, types.Text):
+            return chunk.text or ""
+        if isinstance(chunk, types.Thought):
+            return f"💭 {chunk.text or ''}"
+        if isinstance(chunk, types.ToolCall):
+            name = getattr(chunk, "name", None)
+            if not name or name == "finish":
+                return ""          # the structured-output envelope, not a tool
+            return f"🔧 调用工具：{name}"
+        if isinstance(chunk, types.ToolResult):
+            res = getattr(chunk, "result", None)
+            if res is None:
+                res = getattr(chunk, "error", None)
+            res = str(res or "")
+            if len(res) > 300:
+                res = res[:300] + "…"
+            return f"↳ 工具结果：{res}"
+        if isinstance(chunk, str):
+            return chunk
+        return ""
+
+    def _finish_payload(self, chunk):
+        """Extract the raw decision JSON carried by the `finish` tool call."""
+        args = getattr(chunk, "args", None)
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                return None
+        if not isinstance(args, dict):
+            return None
+        for key in ("output_string", "output", "text", "result"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+            if isinstance(val, dict):
+                return json.dumps(val, ensure_ascii=False)
+        return None
+
+    def _parse_decision_text(self, text):
+        """Parse a commander decision out of raw model output.
+
+        Used when the SDK's structured-output parser rejects the envelope.
+        Tolerates: a bare JSON object, JSON wrapped in prose/markdown fences,
+        and a JSON object embedded in a longer answer.
+        """
+        if not text:
+            return None
+        text = text.strip()
+        # 1) the whole thing may be JSON
+        for candidate in (text,):
+            try:
+                obj = json.loads(candidate)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+        # 2) ```json ... ``` fences
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+        if m:
+            try:
+                obj = json.loads(m.group(1))
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+        # 3) the first balanced {...} block in the text
+        start = text.find("{")
+        while start != -1:
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            obj = json.loads(text[start:i + 1])
+                            if isinstance(obj, dict):
+                                return obj
+                        except Exception:
+                            break
+            start = text.find("{", start + 1)
+        return None
+
+    def _record_planner_chunk(self, chunk):
+        """Record a planner (round-decision) chunk into the commander's trace.
+
+        The planner agent is what actually THINKS each round, so its 💭
+        thinking and 🔧 tool calls belong in the 总指挥's 轨迹 too.
+        """
+        cmd = self.commander
+        if isinstance(chunk, types.Thought):
+            cmd._record_thought(chunk.text)
+        elif isinstance(chunk, types.ToolCall):
+            cmd._record("assistant", "tool_call",
+                        name=getattr(chunk, "name", None),
+                        args=getattr(chunk, "args", None))
+        elif isinstance(chunk, types.ToolResult):
+            cmd._record("tool", "tool_result",
+                        name=getattr(chunk, "name", None),
+                        result=getattr(chunk, "result", None),
+                        error=getattr(chunk, "error", None))
+        elif isinstance(chunk, types.Text):
+            cmd._record_text(chunk.text)
 
     def _chan_label(self, eid):
         """Human label for a channel endpoint ("总指挥" or the egg's title)."""
@@ -786,14 +1512,17 @@ class Canvas:
             out.append(f"{who}：{e.get('text', '')}")
         return "\n".join(out)
 
-    def _task_context(self, task, boxes, channels):
+    def _task_context(self, task, boxes, channels, inbox=None):
         """Build the context handed to a driven egg.
 
         Contains ONLY user+assistant history (no tool calls / thinking):
           * the commander<->egg channel history (what the commander and this egg
             have already said to each other),
           * the AUTHORIZED peer boxes this egg is allowed to read,
-          * the peer channel history for each authorized source.
+          * the peer channel history for each authorized source,
+          * the completion notifications other eggs sent to THIS egg (its
+            inbox) — they are consumed here, so each notification is handed
+            over exactly once.
         """
         eid = task["egg_id"]
         blocks = []
@@ -814,103 +1543,15 @@ class Canvas:
                 blk += ("\n\n【与该蛋的通讯历史（user+assistant）】\n"
                         + self._fmt_channel(pch))
             blocks.append(blk)
+        if inbox:
+            # Consume the notifications addressed to this egg.
+            pend = inbox.pop(eid, None)
+            if pend:
+                blocks.append("【其它蛋发给你的完成通知（请据此继续）】\n"
+                              + "\n\n".join(pend))
         if not blocks:
             return None
         return "\n\n".join(blocks)
-
-    async def _run_task(self, task, boxes, channels, out):
-        """Run ONE task (serial round). Streams the egg's reply tokens.
-
-        The task's result is appended to ``out`` (a caller-owned list) so
-        concurrent commander runs never clobber each other's state.
-        """
-        eid = task["egg_id"]
-        egg = self.eggs.get(eid)
-        if not egg:
-            return
-        yield {"k": "instruct", "egg": egg.id,
-               "text": "🎯 总指挥指令：" + task["message"]}
-        yield {"k": "status", "egg": egg.id, "status": "running"}
-        ctx = self._task_context(task, boxes, channels)
-        collected = []
-        q: asyncio.Queue = asyncio.Queue()
-        pump = asyncio.create_task(
-            _pump(egg.run(task["message"], context=ctx), q))
-        try:
-            while True:
-                item = await q.get()
-                if item is _PUMP_DONE:
-                    break
-                if isinstance(item, tuple) and item and item[0] == "__err__":
-                    yield {"k": "egg", "egg": egg.id,
-                           "text": f"\n（执行出错：{item[1]}）"}
-                    continue
-                collected.append(item)
-                yield {"k": "egg", "egg": egg.id, "text": item}
-        finally:
-            await pump
-        out.append({
-            "egg_id": eid, "message": task["message"],
-            "reply": "".join(collected), "deliver": task.get("deliver") or [],
-        })
-
-    async def _run_tasks_parallel(self, tasks, boxes, channels, out):
-        """Run SEVERAL tasks at once (parallel round); results come back together."""
-        active = {}
-        pumps = []
-        for task in tasks:
-            eid = task["egg_id"]
-            egg = self.eggs.get(eid)
-            if not egg:
-                continue
-            yield {"k": "instruct", "egg": egg.id,
-                   "text": "🎯 总指挥指令：" + task["message"]}
-            yield {"k": "status", "egg": egg.id, "status": "running"}
-            q: asyncio.Queue = asyncio.Queue()
-            ctx = self._task_context(task, boxes, channels)
-            pumps.append(asyncio.create_task(
-                _pump(egg.run(task["message"], context=ctx), q)))
-            active[egg.id] = (q, task)
-        if not active:
-            return
-        merge: asyncio.Queue = asyncio.Queue()
-        async def _consumer(eid, q):
-            while True:
-                item = await q.get()
-                if item is _PUMP_DONE:
-                    await merge.put((eid, _PUMP_DONE))
-                    return
-                await merge.put((eid, item))
-        consumers = [asyncio.create_task(_consumer(eid, q))
-                     for eid, (q, _t) in active.items()]
-        # NOTE: asyncio.gather returns a Future, not a coroutine — create_task()
-        # would reject it ("a coroutine was expected"); ensure_future accepts both.
-        monitor = asyncio.ensure_future(
-            asyncio.gather(*pumps, *consumers, return_exceptions=True))
-        collected = {eid: [] for eid in active}
-        finished = 0
-        try:
-            while finished < len(active):
-                eid, item = await merge.get()
-                if item is _PUMP_DONE:
-                    yield {"k": "status", "egg": eid, "status": "idle"}
-                    yield {"k": "end_egg", "egg": eid}
-                    finished += 1
-                    continue
-                if isinstance(item, tuple) and item and item[0] == "__err__":
-                    yield {"k": "egg", "egg": eid,
-                           "text": f"\n（执行出错：{item[1]}）"}
-                    continue
-                collected[eid].append(item)
-                yield {"k": "egg", "egg": eid, "text": item}
-        finally:
-            await monitor
-        for eid, (_q, task) in active.items():
-            out.append({
-                "egg_id": eid, "message": task["message"],
-                "reply": "".join(collected[eid]),
-                "deliver": task.get("deliver") or [],
-            })
 
     # ---- one-click run of selected eggs (parallel / serial by graph) ----
     def _levels(self, targets):

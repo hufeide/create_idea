@@ -122,6 +122,9 @@ async def _stream_events(ws: WebSocket, agen):
         k = ev.get("k")
         if k == "say":
             await ws.send_json({"type": "token", "eggId": "commander", "text": ev["text"]})
+        elif k == "say_break":
+            # Start a NEW commander message (the previous one is finalized).
+            await ws.send_json({"type": "sayBreak", "eggId": "commander"})
         elif k == "instruct":
             await ws.send_json({"type": "msg", "eggId": ev["egg"], "role": "user",
                                 "text": ev["text"]})

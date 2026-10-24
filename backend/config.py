@@ -97,6 +97,29 @@ OPENAI_MODEL = (
 )
 
 
+def is_corrupt_conversation_error(err):
+    """True when the error means the SDK's persisted conversation is unusable.
+
+    The model server validates every assistant message in the request history:
+    it must carry either ``content`` or ``tool_calls``. A model turn that
+    produced neither (a reasoning-only / empty turn, or a tool call the harness
+    could not map onto structured ``tool_calls``) gets persisted by the SDK, so
+    EVERY later request in that conversation is rejected with HTTP 400
+    ``"Assistant message must contain either 'content' or 'tool_calls'!"``.
+
+    The only recovery is to drop the conversation and start a fresh one.
+    """
+    if err is None:
+        return False
+    text = str(err)
+    return (
+        "must contain either" in text      # empty assistant message (HTTP 400)
+        or "invalid_request" in text
+        or "cannot resume" in text
+        or "not found" in text.lower()
+    )
+
+
 def build_agent_config(
     system_instructions,
     *,

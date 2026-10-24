@@ -1,0 +1,27 @@
+{
+  "session_id": "20261024_223631",
+  "created_at": "20261024_223631",
+  "label": "进行一场辩论赛（运气是一种资产），2个辩手，一个裁判",
+  "history_mode": "brief",
+  "reasoning": {
+    "enabled": true,
+    "supported": null
+  },
+  "eggs": [
+    {
+      "id": "e1",
+      "title": "项目：进行一场辩论赛（运气是一种资产），2个辩手，一个",
+      "prompt": "进行一场辩论赛（运气是一种资产），2个辩手，一个裁判",
+      "type": "idea",
+      "x": 80,
+      "y": 80,
+      "parent": null,
+      "conversation_id": null,
+      "running": false,
+      "transcript": []
+    }
+  ],
+  "edges": [],
+  "commander": [],
+  "commander_conversation_id": null
+}
