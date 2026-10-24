@@ -49,6 +49,14 @@ _CONSUME_VERBS = ("综合", "评判", "比较", "阅读", "基于", "依据", "�
                    "权衡", "裁决", "总结", "结合", "汇总", "整合", "评估",
                    "归纳", "复核", "批改", "审阅")
 
+# An egg whose ROLE is one of these consumes other eggs' output (a judge, an
+# aggregator, a reviewer).  Such an egg must never run in the same round as
+# the producers it is supposed to weigh — the structure of the task, not the
+# wording of the instruction, decides that.
+_CONSUMER_ROLES = ("裁判", "评审", "评判", "评委", "仲裁", "汇总", "整合",
+                   "总结", "对比", "比较", "协调", "监督", "审核", "验收",
+                   "分析", "决策", "裁定", "权衡", "复盘", "汇报", "主持")
+
 
 async def _pump(agen, q):
     """Drain an async generator into a queue on its OWN task.
@@ -588,6 +596,7 @@ class Canvas:
         running = {}      # egg_id -> 本次指挥中在后台运行的蛋
         events = asyncio.Queue()   # 后台产生的 UI 事件
         watch_base = {}   # egg_id -> 上次裁决时的会话长度（用来算增量）
+        postponed = []    # 上一轮因依赖被推迟的任务（下一轮要派活给它们）
         reported = set()  # 已上报过的告警，避免每轮重复刷屏
         all_results = []  # (title, message, reply) for the final recap
         final_summary = ""
@@ -632,6 +641,7 @@ class Canvas:
                     dec = asyncio.create_task(self._commander_decide(
                         text, summary, targets, boxes, channels, cmd_hist,
                         round_no, watch=watch, notified=list(notified),
+                        deferred=list(postponed),
                         sink=lambda t: events.put_nowait(
                             {"k": "say", "text": t})))
                     bg.append(dec)
@@ -655,10 +665,43 @@ class Canvas:
                         _uniq.append(t)
                     tasks = _uniq
                     if decision.get("action") == "finish":
-                        # 只有真正完成才跳出循环。
-                        final_summary = decision.get("summary") or ""
-                        normal_exit = True
-                        break
+                        # A task that was POSTPONED for a dependency and whose
+                        # dependencies are now satisfied is still OUTSTANDING
+                        # work -> the instruction is NOT done yet. The commander
+                        # may not wrap up while such a task is pending; we
+                        # dispatch it instead (a judge that never runs could
+                        # not judge anything).
+                        ready = [d for d in postponed
+                                 if all(dep in boxes
+                                        for dep in (d.get("depends_on") or []))]
+                        if ready:
+                            names = "、".join(d["title"] for d in ready)
+                            cmd_hist.append({
+                                "role": "user",
+                                "text": (f"【调度】{names} 仍在等待被派活"
+                                         f"（依赖已满足），指令尚未完成；"
+                                         f"请先派活给它再收尾。"),
+                            })
+                            decision = {
+                                "action": "dispatch",
+                                "tasks": [{
+                                    "egg_id": d["egg_id"],
+                                    "message": d["message"],
+                                    # it must be able to read the conclusions it
+                                    # was waiting for
+                                    "deliver": [b for b in boxes
+                                                if b != d["egg_id"]],
+                                    "notify": [],
+                                    "depends_on": d.get("depends_on") or [],
+                                } for d in ready],
+                                "summary": decision.get("summary") or "",
+                                "note": "继续完成被推迟的任务",
+                            }
+                        else:
+                            # 只有真正完成才跳出循环。
+                            final_summary = decision.get("summary") or ""
+                            normal_exit = True
+                            break
 
                     started = 0
                     deferred = []
@@ -678,6 +721,14 @@ class Canvas:
                                          f"再派活。"),
                             })
                         tasks = runnable
+                        # Remember them: the NEXT round must dispatch them.
+                        postponed = [{
+                            "egg_id": d["egg_id"],
+                            "title": self.eggs[d["egg_id"]].title
+                            if d["egg_id"] in self.eggs else d["egg_id"],
+                            "message": d.get("message") or "",
+                            "depends_on": d.get("depends_on") or [],
+                        } for d in deferred if d["egg_id"] in self.eggs]
                     if tasks:
                         # --- this round's plan (1 task = serial, N = parallel) ---
                         mode = "parallel" if len(tasks) > 1 else "serial"
@@ -988,6 +1039,14 @@ class Canvas:
                 end = min(end, p)
         return msg[start:end]
 
+    def _is_consumer(self, eid):
+        """True when this egg's ROLE consumes other eggs' output."""
+        egg = self.eggs.get(eid)
+        if not egg:
+            return False
+        blob = f"{egg.title} {getattr(egg, 'prompt', '')}"
+        return any(k in blob for k in _CONSUMER_ROLES)
+
     def _resolve_dependencies(self, tasks, boxes=None):
         """Fill in the dependencies the commander did not declare.
 
@@ -1014,6 +1073,14 @@ class Canvas:
             for u in tasks:
                 if u["egg_id"] in refs:
                     deps[t["egg_id"]].add(u["egg_id"])
+            # STRUCTURAL rule: a judge/aggregator must not run alongside the
+            # producers it is supposed to weigh — it waits for their results.
+            if self._is_consumer(t["egg_id"]):
+                for u in tasks:
+                    if u["egg_id"] == t["egg_id"]:
+                        continue
+                    if not self._is_consumer(u["egg_id"]):
+                        deps[t["egg_id"]].add(u["egg_id"])
             # 授权读取它被要求参考的、已经有结论的蛋
             deliver = set(t.get("deliver") or [])
             for r in refs:
@@ -1168,7 +1235,7 @@ class Canvas:
 
     async def _commander_decide(self, text, summary, targets, boxes, channels,
                                 cmd_hist, round_no, watch=None, notified=None,
-                                sink=None):
+                                sink=None, deferred=None):
         """Ask the commander LLM for the NEXT round only (reactive adjudication).
 
         The commander sees:
@@ -1229,7 +1296,10 @@ class Canvas:
                 "说明不超过 3 句，不要写长篇大论，也不要重复已有结论。\n"
                 "1) 你是一个【循环】：只要用户指令还没真正完成，就继续给下一步指令；"
                 "只有当所有子蛋都交付了结论、指令确实完成时，才 action='finish' 并在 "
-                "summary 里给出最终总结。不要因为某轮没有现成任务就提前结束。\n"
+                "summary 里给出最终总结。不要因为某轮没有现成任务就提前结束。"
+                "特别注意：子蛋还没有产出结论，正说明现在应该【派活】而不是收尾；"
+                "只有在你亲自确认了所有子蛋的结论都已在【已有的结论盒子】里、"
+                "且用户指令确实达成了，才可以 finish。\n"
                 "2) 每轮先读【子蛋实时监控】：\n"
                 "   · 会话长度/增量：增量>0 说明该蛋还在推进；增量=0 且静默很久说明它"
                 "卡住了 —— 你可以重新给它派活、换一只蛋接手，或直接收尾。\n"
@@ -1237,6 +1307,8 @@ class Canvas:
                 "   · 【监控告警】：运行超时/长时间无输出的蛋需要你裁决。\n"
                 "3) 一次只给本轮的指令。若本轮这些蛋互不依赖，可同时给多个（并行）；"
                 "若需要等某个结果才能定下一步，就只给一个（串行）。\n"
+                "3c) 如果【上一轮被推迟的任务】里还有蛋在等待，说明还有活没干完"
+                "（例如裁判还没裁决）——必须先派活给它，不能直接 finish。\n"
                 "3a) 同一只蛋在一轮里只给一个任务；已经产出结论的蛋，除非指令明确要求"
                 "它继续推进，否则不要重复派它。\n"
                 "3b) 【时序/依赖】有先后关系的任务必须用 depends_on 声明依赖的蛋 id，"
@@ -1289,8 +1361,18 @@ class Canvas:
                 if wt:
                     workspaces.append(str(wt))
             ws_desc = "\n".join(f"- {w}" for w in workspaces) or "（本轮没有可检视的目录）"
+            deferred_desc = ""
+            if deferred:
+                deferred_desc = ("【上一轮被推迟的任务（依赖已满足，该派活了）】\n"
+                                 + "\n".join(
+                                     f"- 蛋「{d.get('title')}」(id={d.get('egg_id')}) "
+                                     f"等待 {', '.join(d.get('depends_on') or [])} 的产出，"
+                                     f"本轮请派活给它"
+                                     for d in deferred)
+                                 + "\n\n")
             prompt = (
                 f"可选子蛋：\n{target_desc}\n\n"
+                f"{deferred_desc}"
                 f"已有的结论盒子：\n{boxes_desc}\n\n"
                 f"子蛋实时监控：\n{watch_desc}\n\n"
                 f"通讯历史（user+assistant）：\n{chan_desc}\n\n"

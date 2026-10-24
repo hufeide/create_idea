@@ -5,7 +5,7 @@
   "history_mode": "brief",
   "reasoning": {
     "enabled": true,
-    "supported": false
+    "supported": null
   },
   "eggs": [
     {
@@ -142,7 +142,7 @@
       "y": 380,
       "parent": "e2",
       "conversation_id": null,
-      "running": true,
+      "running": false,
       "transcript": [
         {
           "ts": "2026-10-24T22:49:13.015",
@@ -629,7 +629,7 @@
       "y": 380,
       "parent": "e2",
       "conversation_id": "df5adec74454e1ee3110ec30494add82",
-      "running": true,
+      "running": false,
       "transcript": [
         {
           "ts": "2026-10-24T22:49:13.142",
