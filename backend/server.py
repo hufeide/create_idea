@@ -128,7 +128,8 @@ async def _stream_events(ws: WebSocket, agen):
         elif k == "egg":
             await ws.send_json({"type": "token", "eggId": ev["egg"], "text": ev["text"]})
         elif k == "plan":
-            await ws.send_json({"type": "plan", "steps": ev["steps"]})
+            await ws.send_json({"type": "plan", "steps": ev["steps"],
+                                "round": ev.get("round", 0)})
         elif k == "status":
             await ws.send_json({"type": "status", "eggId": ev["egg"],
                                 "status": ev["status"]})
@@ -147,6 +148,9 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
     elif t == "generate":
         created = await canvas.generate(msg.get("goal", ""))
         await ws.send_json({"type": "eggs", **canvas.view()})
+        # A generate opens a BRAND-NEW session: wipe any stale commander history
+        # shown in the panel so the user doesn't see the previous idea's chat.
+        await ws.send_json({"type": "clearHistory", "eggId": "commander"})
         for e in created:
             await ws.send_json(
                 {"type": "system", "eggId": e.id,
@@ -216,6 +220,12 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
             try:
                 view = await canvas.load(sid)
                 await ws.send_json({"type": "eggs", **view})
+                # Fresh session => clear any stale displayed commander/egg histories
+                # BEFORE replaying the loaded transcripts (otherwise the old chat
+                # would be appended to).
+                await ws.send_json({"type": "clearHistory", "eggId": "commander"})
+                for e in canvas.eggs.values():
+                    await ws.send_json({"type": "clearHistory", "eggId": e.id})
                 # Replay each egg's (and the commander's) stored transcript so the
                 # UI shows the prior conversation. The SDK resumes the LLM session
                 # on the next message via the saved conversation_id + save_dir.
@@ -239,6 +249,8 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
         canvas.edges.clear()
         sid = canvas._new_session()
         await ws.send_json({"type": "eggs", **canvas.view()})
+        # A new (empty) session starts with a clean commander chat.
+        await ws.send_json({"type": "clearHistory", "eggId": "commander"})
         await ws.send_json({"type": "sessions", "sessions": Canvas.list_sessions()})
         await ws.send_json({"type": "session", "sessionId": sid})
 

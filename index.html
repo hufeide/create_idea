@@ -85,6 +85,10 @@
   #commander .c-plan-h{font-weight:700;color:#7fd1ff;margin-bottom:4px;}
   #commander .c-plan-step{color:#cdd6e4;line-height:1.6;}
   #commander .c-plan-step b{color:#fff;}
+  #commander .c-plan-mode{display:inline-block;font-size:11px;font-weight:700;padding:0 6px;border-radius:6px;margin-right:6px;}
+  #commander .c-plan-mode.parallel{color:#7fffd0;background:rgba(127,255,208,.12);}
+  #commander .c-plan-mode.serial{color:#ffd27f;background:rgba(255,210,127,.12);}
+  #commander .c-plan-deliver{color:#c9a6ff;font-size:11px;}
   #commander .c-foot{padding:10px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:6px;}
   #commander select{width:100%;}
 
@@ -262,13 +266,24 @@ function handle(m){
     case 'plan': {
       const box=document.createElement('div'); box.className='c-plan';
       const h=document.createElement('div'); h.className='c-plan-h';
-      h.textContent='🗺 总指挥规划图';
+      h.textContent='🗺 总指挥规划图' + (m.round?('（第 '+m.round+' 轮）'):'');
       box.appendChild(h);
       (m.steps||[]).forEach(s=>{
         const row=document.createElement('div'); row.className='c-plan-step';
+        const tag=document.createElement('span');
+        const serial=(s.mode||'parallel')==='serial';
+        tag.className='c-plan-mode '+(serial?'serial':'parallel');
+        tag.textContent=serial?'→ 串行':'⫼ 并行';
         const b=document.createElement('b'); b.textContent=s.title||s.egg_id;
         const t=document.createElement('span'); t.textContent='：'+s.message;
-        row.appendChild(b); row.appendChild(t); box.appendChild(row);
+        row.appendChild(tag); row.appendChild(b); row.appendChild(t);
+        // Authorized hand-off: the commander routed a peer's conclusion to this egg.
+        if(s.deliver && s.deliver.length){
+          const d=document.createElement('span'); d.className='c-plan-deliver';
+          d.textContent='  📮 转交：'+s.deliver.join('、');
+          row.appendChild(d);
+        }
+        box.appendChild(row);
       });
       $('#cmdBody').appendChild(box); $('#cmdBody').scrollTop=$('#cmdBody').scrollHeight; break;
     }
@@ -280,6 +295,11 @@ function handle(m){
       if(m.eggId==='commander'){
         // A finished run/plan must never leave an egg stuck 运行中/计划中.
         for(const id in state.eggs){ const eg=state.eggs[id]; if(eg.running||eg.planned) setEggStatus(eg,'idle'); }
+      } else {
+        // Guarantee the egg panel matches the server transcript (轨迹): the live
+        // stream may have been lost, leaving the panel blank while the trace is
+        // complete. Re-sync from the server on completion.
+        refreshEggPanel(m.eggId);
       }
       if(traceKey===m.eggId) fetchTrace(m.eggId);
       break;
@@ -289,6 +309,7 @@ function handle(m){
     case 'error': toast('错误: '+m.message); restoreGenBtn(); break;
     case 'sessions': fillSessionSel(m.sessions); break;
     case 'history': applyHistory(m.eggId, m.transcript); break;
+    case 'clearHistory': clearHistory(m.eggId); break;
     case 'session': currentSessionId = m.sessionId || ''; $('#sessionSel').value = currentSessionId; break;
   }
 }
@@ -348,6 +369,25 @@ function applyHistory(eggId, transcript){
     const c = transcriptToContent(t);
     if(c) e.messages.push({role: historyRole(t), content: c});
   }
+  renderMsgs(e);
+}
+/* Wipe a displayed conversation (used when a fresh session is created/loaded so
+   the panel doesn't keep showing the previous idea's history). For the
+   commander we re-seed the welcome message for a clean slate. */
+function clearHistory(eggId){
+  if(eggId === 'commander'){
+    const body = $('#cmdBody');
+    body.innerHTML = '';
+    const d = document.createElement('div');
+    d.className = 'c-msg';
+    d.innerHTML = '<b>总指挥已就位。</b><br/>在下方下达协调指令，例如「让『数据获取』与『展示』对齐字段」。只有用户连线相连的蛋才会互通消息。';
+    body.appendChild(d);
+    body.scrollTop = 0;
+    return;
+  }
+  const e = state.eggs[eggId];
+  if(!e) return;
+  e.messages = [];
   renderMsgs(e);
 }
 $('#loadBtn').addEventListener('click', ()=>{
@@ -557,6 +597,21 @@ function appendToken(eggId, text){
   else { const b=state.eggs[eggId].el.querySelector('.msgs'); b.scrollTop=b.scrollHeight; }
 }
 
+/* Rebuild an egg's panel from the server transcript so it always matches 轨迹,
+   even if the live WebSocket stream was lost mid-run (run errored/hung before
+   streaming, or the socket dropped) — otherwise the panel stays blank while the
+   trace is complete and the egg can look stuck 运行中. */
+async function refreshEggPanel(eggId){
+  if(eggId==='commander') return;
+  if(!state.eggs[eggId]) return;
+  try{
+    const r = await fetch('/api/trace/'+encodeURIComponent(eggId));
+    if(!r.ok) return;
+    const d = await r.json();
+    applyHistory(eggId, d.transcript);
+  }catch(e){}
+}
+
 function sendCommand(egg, text){
   pushMsg(egg,'user',text);
   egg.el.querySelector('.cmd').value='';
@@ -670,7 +725,13 @@ function renderTrace(data, key){
   const label = key==='commander' ? '总指挥' : (data.title || key);
   $('#traceTitle').textContent = '对话轨迹 · ' + label;
   $('#traceConn').textContent = data.connected ? '● 已连接模型' : '○ 未连接模型';
-  const body=$('#traceBody'); body.innerHTML='';
+  const body=$('#traceBody');
+  // Preserve the user's manual scroll position: only auto-follow to the bottom
+  // when the user was already at/near the bottom; otherwise keep them where they
+  // scrolled instead of bouncing back down on every refresh.
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 30;
+  const prevTop = body.scrollTop;
+  body.innerHTML='';
   const list=data.transcript||[];
   if(!list.length){
     body.innerHTML='<div class="trace-item"><div class="empty">暂无对话记录。向该蛋发送命令后，这里会按时间顺序显示：用户指令、模型回复、思考（💭）与工具调用/结果。</div></div>';
@@ -709,7 +770,11 @@ function renderTrace(data, key){
     }
     body.appendChild(div);
   }
-  body.scrollTop=body.scrollHeight;
+  if(nearBottom){
+    body.scrollTop=body.scrollHeight;   // follow new content
+  } else {
+    body.scrollTop=prevTop;             // keep the user's manual position
+  }
 }
 /* Build the tab bar: 总指挥 + every egg (idea / sub), clickable to switch. */
 function buildTraceTabs(active){

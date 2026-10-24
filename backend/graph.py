@@ -60,13 +60,28 @@ class IdeaPlan(pydantic.BaseModel):
     eggs: list[IdeaSpec]
 
 
-class CommanderStep(pydantic.BaseModel):
+class CommanderTask(pydantic.BaseModel):
+    """One dispatch decision for the NEXT round only (reactive adjudication)."""
     egg_id: str
     message: str
+    # Box ids (the id of the egg that produced the box) that the commander
+    # AUTHORIZES this task to read. Only the commander may route a box from one
+    # egg to another — an undelivered box stays with the commander, who
+    # arbitrates it.
+    deliver: list[str] = []
 
 
-class CommanderPlan(pydantic.BaseModel):
-    steps: list[CommanderStep]
+class CommanderDecision(pydantic.BaseModel):
+    """The commander's decision for ONE round.
+
+    ``action``:
+      - "dispatch" -> run ``tasks`` now (1 task = serial, N tasks = parallel)
+      - "finish"   -> the instruction is complete; ``summary`` is the recap
+    """
+    action: str = "dispatch"
+    tasks: list[CommanderTask] = []
+    summary: str = ""
+    note: str = ""
 
 
 class Canvas:
@@ -129,7 +144,11 @@ class Canvas:
         self.session_dir = base
         self.created_at = ts
         self.label = label
-        self.commander.bind_session(base)
+        # A fresh canvas gets a FRESH commander conversation (not the previous
+        # canvas's id/transcript); the commander keeps its own sub-directory
+        # (session_dir/commander_data) just like each egg has its worktree.
+        self.commander.bind_session(base, None)
+        self.commander.transcript = []
         return sid
 
     def ensure_session(self):
@@ -326,6 +345,9 @@ class Canvas:
                 pass
         for e in list(self.eggs.values()):
             await e.stop()
+        # Close the previous commander's LLM connection so the fresh session does
+        # not leak the old conversation handle; bind_session then starts clean.
+        await self.commander.stop()
         self.eggs.clear()
         self.edges.clear()
         self._new_session(label=(goal[:40] if goal else None))
@@ -490,9 +512,19 @@ class Canvas:
 
     # ---- commander ----
     async def commander_run(self, text, targets=None):
-        """Commander either advises (no targets) or actively DRIVES the selected
-        eggs: it plans per-egg messages, sends them (streaming each egg's real
-        reply), then recaps how the user's instruction was completed.
+        """Commander drives the selected eggs REACTIVELY, one round at a time.
+
+        The commander no longer plans the whole serial/parallel graph up front.
+        Every round it looks at what came back and decides the NEXT move:
+          * one task   -> serial: that egg runs alone, its conclusion returns
+          * many tasks -> parallel: several eggs run at once, conclusions return
+                          together
+        Each egg conclusion lands in a "box" (消息盒子) held by the commander.
+        The commander may AUTHORIZE a box to be delivered to another egg — that
+        authorization is the ONLY way two eggs talk to each other; an
+        unauthorized message stays with the commander, who arbitrates it.
+        All commander<->egg traffic carries the user+assistant conversation
+        history (tool calls / thinking are left out for now).
 
         Yields UI events:
           {"k":"say","text":..}      -> stream into the commander chat
@@ -500,6 +532,7 @@ class Canvas:
           {"k":"egg","egg":id,"text":..}      -> stream an egg's reply tokens
           {"k":"status","egg":id,"status":..} -> egg status (planned/running/idle)
           {"k":"end_egg","egg":id}            -> finalize an egg's stream
+          {"k":"plan","round":n,"steps":[..]} -> the current round's plan
           {"k":"end"}                          -> finalize the commander stream
         """
         targets = [t for t in (targets or []) if t in self.eggs]
@@ -512,69 +545,334 @@ class Canvas:
             yield {"k": "end"}
             return
 
-        # Control mode: plan, drive each egg, then recap.
-        plan = await self._commander_plan(text, summary, targets)
-        if not plan:
-            plan = [{"egg_id": t, "message": text} for t in targets]
-        plan_txt = "\n".join(
-            f"→ [{self.eggs[s['egg_id']].title}] {s['message']}"
-            for s in plan if s["egg_id"] in self.eggs
-        )
-        narration = f"我来指挥 {len(targets)} 个蛋完成该指令，共 {len(plan)} 步：\n{plan_txt}\n\n"
-        self.commander._record("system", "plan", text=plan_txt)
-        self.commander._record("assistant", "text", text=narration)
-        yield {"k": "say", "text": narration}
+        # ---- control mode: reactive, round by round ----
+        # The commander/egg channels carry user+assistant history only.
+        summary = self._commander_context(targets, mode="brief")
+        boxes = {}        # egg_id -> {"result": str}   (the 消息盒子)
+        channels = {}     # (src, dst) -> [{"role","text"}]  user+assistant only
+        cmd_hist = []     # commander-side user+assistant history
+        cmd_hist.append({"role": "user", "text": text})
+        all_results = []  # (title, message, reply) for the final recap
+        final_summary = ""
+        max_rounds = 12
+        round_no = 0
 
-        # Eggs in the plan are queued ("计划中"); they run one-by-one (serial),
-        # each waiting for the previous to finish.
-        for s in plan:
-            if s["egg_id"] in self.eggs:
+        while round_no < max_rounds:
+            round_no += 1
+            decision = await self._commander_decide(
+                text, summary, targets, boxes, channels, cmd_hist, round_no)
+            tasks = [t for t in (decision.get("tasks") or [])
+                     if t.get("egg_id") in self.eggs]
+            if decision.get("action") == "finish" or not tasks:
+                final_summary = decision.get("summary") or ""
+                break
+
+            # --- this round's plan (1 task = serial, N tasks = parallel) ---
+            mode = "parallel" if len(tasks) > 1 else "serial"
+            plan_steps = [
+                {"egg_id": t["egg_id"],
+                 "title": self.eggs[t["egg_id"]].title,
+                 "message": t["message"],
+                 "deliver": t.get("deliver") or [],
+                 "mode": mode}
+                for t in tasks
+            ]
+            note = decision.get("note") or ""
+            narration = (f"【第 {round_no} 轮 · {mode}】{note}\n" + "\n".join(
+                f"→ [{s['title']}] {s['message']}"
+                + (f"  (授权转交: {', '.join(s['deliver'])})" if s["deliver"] else "")
+                for s in plan_steps))
+            self.commander._record("system", "plan", text=narration)
+            self.commander._record("assistant", "text", text=narration)
+            cmd_hist.append({"role": "assistant", "text": narration})
+            yield {"k": "say", "text": narration}
+            yield {"k": "plan", "round": round_no, "steps": plan_steps}
+            for s in plan_steps:
                 yield {"k": "status", "egg": s["egg_id"], "status": "planned"}
 
-        # ---- plan view (规划图) ----
-        plan_steps = [
-            {"egg_id": s["egg_id"],
-             "title": self.eggs[s["egg_id"]].title if s["egg_id"] in self.eggs else s["egg_id"],
-             "message": s["message"]}
-            for s in plan if s["egg_id"] in self.eggs
-        ]
-        yield {"k": "plan", "steps": plan_steps}
+            # ---- execute this round ----
+            # A round with ONE task is serial (that egg alone, then its result
+            # comes back for the commander's next decision); a round with SEVERAL
+            # tasks runs them in parallel and returns all their results at once.
+            # Either way the results are handed back to the commander, who then
+            # decides the next round — no pre-baked multi-step graph.
+            round_results = []
+            if len(plan_steps) == 1:
+                async for ev in self._run_task(plan_steps[0], boxes, channels,
+                                              round_results):
+                    yield ev
+            else:
+                async for ev in self._run_tasks_parallel(plan_steps, boxes,
+                                                         channels, round_results):
+                    yield ev
 
-        # ---- parallel execution ----
-        # Every selected egg is launched at once; their reply tokens stream in
-        # concurrently and are yielded as they arrive (interleaved per egg), so the
-        # eggs truly run in parallel instead of one-by-one.
-        active = {}                       # egg_id -> its pump output queue
+            # ---- file the results into boxes + channel history ----
+            for r in round_results:
+                eid, msg, reply = r["egg_id"], r["message"], r["reply"]
+                egg = self.eggs.get(eid)
+                if not egg:
+                    continue
+                all_results.append((egg.title, msg, reply))
+                boxes[eid] = {"result": reply}
+                # Commander <-> egg channel: the instruction and the reply.
+                ch = channels.setdefault(("commander", eid), [])
+                ch.append({"role": "user", "text": msg})
+                ch.append({"role": "assistant", "text": reply})
+                # Any egg this one was AUTHORIZED to hear from keeps a
+                # peer-to-peer channel too, so the delivered context persists.
+                for src in (r.get("deliver") or []):
+                    pch = channels.setdefault((src, eid), [])
+                    pch.append({"role": "user",
+                                "text": f"来自蛋「{self.eggs[src].title if src in self.eggs else src}」的结论"})
+                    pch.append({"role": "assistant", "text": reply})
+                # Feed the result back to the commander as a user turn so its
+                # next decision is informed by what actually came out.
+                cmd_hist.append({
+                    "role": "user",
+                    "text": f"【子蛋「{egg.title}」完成】\n结论：{reply[:2000]}",
+                })
+                yield {"k": "status", "egg": eid, "status": "idle"}
+                yield {"k": "end_egg", "egg": eid}
+
+        # Recap: let the commander summarize completion (fallback to plain text).
+        try:
+            if final_summary:
+                self.commander._record("assistant", "text", text=final_summary)
+                yield {"k": "say", "text": final_summary}
+            else:
+                res_txt = "\n\n".join(
+                    f"[{title}] 指令：{msg}\n结果：{reply[:600]}"
+                    for (title, msg, reply) in all_results
+                )
+                recap_prompt = (
+                    f"用户指令：{text}\n\n各蛋执行情况：\n{res_txt}\n\n"
+                    "请用 2-4 句中文总结该指令的完成情况与后续建议。"
+                )
+                async for tok in self.commander.run(recap_prompt, summary):
+                    yield {"k": "say", "text": tok}
+        except Exception as ex:  # pragma: no cover
+            yield {"k": "say", "text": f"（总结失败：{ex}）"}
+        yield {"k": "end"}
+
+    async def _commander_decide(self, text, summary, targets, boxes, channels,
+                                cmd_hist, round_no):
+        """Ask the commander LLM for the NEXT round only (reactive adjudication).
+
+        The commander sees:
+          * the original instruction
+          * the eggs it may drive (id / title / role)
+          * the boxes collected so far (each egg's latest conclusion)
+          * the user+assistant conversation history of its channels
+        and answers with either a set of tasks to run NOW (1 = serial, N =
+        parallel) or ``action="finish"`` when the instruction is complete.
+
+        Each task may name ``deliver`` — the boxes the commander AUTHORIZES
+        this egg to read. That is the only channel through which one egg's
+        message reaches another egg; anything not delivered stays with the
+        commander for arbitration.
+        """
+        if not SDK_OK:
+            return self._fake_commander_decide(text, targets, boxes, round_no)
+        try:
+            target_desc = "\n".join(
+                f"- id={self.eggs[t].id} 标题={self.eggs[t].title} "
+                f"职责={self.eggs[t].prompt}"
+                for t in targets
+            )
+            boxes_desc = "\n".join(
+                f"- 来自蛋「{self.eggs[b].title if b in self.eggs else b}」的结论：\n"
+                f"{v.get('result', '')[:800]}"
+                for b, v in boxes.items()
+            ) or "（目前还没有任何蛋的结论）"
+            chan_desc = "\n".join(
+                f"### {self._chan_label(s)} → {self._chan_label(d)}\n"
+                f"{self._fmt_channel(ch)}"
+                for (s, d), ch in channels.items()
+            ) or "（暂无通讯记录）"
+            sys_instr = types.CustomSystemInstructions(text=(
+                "你是总指挥（Commander），以【逐轮反应式】方式驱动若干子蛋完成用户指令。\n"
+                "重要机制：你【不预先规划完整流程】。每一轮你只决定【下一步】做什么，"
+                "等这一轮的结果回来后，再根据实际结果决定下一轮。\n"
+                "规则：\n"
+                "1) 一次只给本轮的指令。若本轮这些蛋互不依赖，可同时给多个（并行）；"
+                "若需要等某个结果才能定下一步，就只给一个（串行）。\n"
+                "2) 子蛋的结论会回传给你。你据此裁决：还需要谁继续做、还是已经完成。\n"
+                "3) 子蛋之间【默认不能互相通信】。只有你（总指挥）有权让某个结论从一只蛋"
+                "传给另一只蛋：若本轮某只蛋需要参考另一只蛋的结论，在该任务的 deliver "
+                "字段里写上来源蛋的 id，即为【授权转发】；未授权的结论只留在你这里由你裁决。\n"
+                "4) 通讯需要携带上下文：user+assistant 的历史消息即可（暂不需要 tool 和 thinking）。\n"
+                "5) 任务完成时 action='finish'，并在 summary 里给出最终总结；"
+                "否则 action='dispatch' 给出本轮 tasks。\n"
+                "返回结构化 decision（action + tasks[egg_id, message, deliver] + "
+                "summary + note）。note 用一句中文说明本轮意图。"
+            ))
+            caps = types.CapabilitiesConfig(
+                enabled_tools=[], enable_subagents=False,
+                agent_behavior=types.AgentBehavior.MINIMAL,
+            )
+            prompt = (
+                f"可选子蛋：\n{target_desc}\n\n"
+                f"已有的结论盒子：\n{boxes_desc}\n\n"
+                f"通讯历史（user+assistant）：\n{chan_desc}\n\n"
+                f"画布状态：\n{summary}\n\n"
+                f"用户指令：{text}\n\n"
+                f"这是第 {round_no} 轮。请只决定【本轮】的动作。"
+            )
+            async with Agent(build_agent_config(
+                system_instructions=sys_instr, capabilities=caps,
+                response_schema=CommanderDecision,
+            )) as planner:
+                resp = await planner.chat(prompt)
+                data = await resp.structured_output()
+            if isinstance(data, dict):
+                action = data.get("action") or "dispatch"
+                raw_tasks = data.get("tasks") or []
+                summary_txt = data.get("summary") or ""
+                note = data.get("note") or ""
+            else:
+                action = getattr(data, "action", "dispatch")
+                raw_tasks = getattr(data, "tasks", []) or []
+                summary_txt = getattr(data, "summary", "") or ""
+                note = getattr(data, "note", "") or ""
+            valid = set(targets)
+            out_tasks = []
+            for t in raw_tasks:
+                if isinstance(t, dict):
+                    eid = t.get("egg_id"); message = t.get("message")
+                    deliver = t.get("deliver") or []
+                else:
+                    eid = t.egg_id; message = t.message
+                    deliver = getattr(t, "deliver", []) or []
+                if eid in valid and message:
+                    # only deliver boxes that actually exist
+                    out_tasks.append({
+                        "egg_id": eid, "message": message,
+                        "deliver": [d for d in deliver
+                                    if d in boxes and d != eid],
+                    })
+            if action != "dispatch" or not out_tasks:
+                return {"action": "finish", "tasks": [],
+                        "summary": summary_txt, "note": note}
+            return {"action": "dispatch", "tasks": out_tasks,
+                    "summary": summary_txt, "note": note}
+        except Exception as ex:  # pragma: no cover
+            print(f"[commander-decide] failed, using fallback: {ex}")
+            return self._fake_commander_decide(text, targets, boxes, round_no)
+
+    def _fake_commander_decide(self, text, targets, boxes, round_no):
+        """No model / planner failed: broadcast once, then finish."""
+        if boxes or round_no > 1:
+            return {"action": "finish", "tasks": [],
+                    "summary": "（无可用模型，无法继续指挥子蛋。）", "note": ""}
+        return {"action": "dispatch",
+                "tasks": [{"egg_id": t, "message": text, "deliver": []}
+                          for t in targets],
+                "summary": "", "note": ""}
+
+    def _chan_label(self, eid):
+        """Human label for a channel endpoint ("总指挥" or the egg's title)."""
+        if eid == "commander":
+            return "总指挥"
+        if eid in self.eggs:
+            return f"蛋「{self.eggs[eid].title}」"
+        return str(eid)
+
+    def _fmt_channel(self, entries):
+        """Render a channel's user+assistant history as readable text."""
+        out = []
+        for e in entries:
+            role = e.get("role")
+            who = "用户" if role == "user" else "助手"
+            out.append(f"{who}：{e.get('text', '')}")
+        return "\n".join(out)
+
+    def _task_context(self, task, boxes, channels):
+        """Build the context handed to a driven egg.
+
+        Contains ONLY user+assistant history (no tool calls / thinking):
+          * the commander<->egg channel history (what the commander and this egg
+            have already said to each other),
+          * the AUTHORIZED peer boxes this egg is allowed to read,
+          * the peer channel history for each authorized source.
+        """
+        eid = task["egg_id"]
+        blocks = []
+        ch = channels.get(("commander", eid))
+        if ch:
+            blocks.append(
+                "【你与总指挥的通讯历史（user+assistant）】\n"
+                + self._fmt_channel(ch))
+        for src in task.get("deliver") or []:
+            box = boxes.get(src)
+            if not box:
+                continue
+            stitle = self.eggs[src].title if src in self.eggs else src
+            blk = (f"【总指挥授权转交：蛋「{stitle}」的结论】\n"
+                   f"{box.get('result', '')}")
+            pch = channels.get((src, eid))
+            if pch:
+                blk += ("\n\n【与该蛋的通讯历史（user+assistant）】\n"
+                        + self._fmt_channel(pch))
+            blocks.append(blk)
+        if not blocks:
+            return None
+        return "\n\n".join(blocks)
+
+    async def _run_task(self, task, boxes, channels, out):
+        """Run ONE task (serial round). Streams the egg's reply tokens.
+
+        The task's result is appended to ``out`` (a caller-owned list) so
+        concurrent commander runs never clobber each other's state.
+        """
+        eid = task["egg_id"]
+        egg = self.eggs.get(eid)
+        if not egg:
+            return
+        yield {"k": "instruct", "egg": egg.id,
+               "text": "🎯 总指挥指令：" + task["message"]}
+        yield {"k": "status", "egg": egg.id, "status": "running"}
+        ctx = self._task_context(task, boxes, channels)
+        collected = []
+        q: asyncio.Queue = asyncio.Queue()
+        pump = asyncio.create_task(
+            _pump(egg.run(task["message"], context=ctx), q))
+        try:
+            while True:
+                item = await q.get()
+                if item is _PUMP_DONE:
+                    break
+                if isinstance(item, tuple) and item and item[0] == "__err__":
+                    yield {"k": "egg", "egg": egg.id,
+                           "text": f"\n（执行出错：{item[1]}）"}
+                    continue
+                collected.append(item)
+                yield {"k": "egg", "egg": egg.id, "text": item}
+        finally:
+            await pump
+        out.append({
+            "egg_id": eid, "message": task["message"],
+            "reply": "".join(collected), "deliver": task.get("deliver") or [],
+        })
+
+    async def _run_tasks_parallel(self, tasks, boxes, channels, out):
+        """Run SEVERAL tasks at once (parallel round); results come back together."""
+        active = {}
         pumps = []
-        plan_ctx = self._commander_context(
-            [s["egg_id"] for s in plan if s["egg_id"] in self.eggs]
-        )
-        for s in plan:
-            egg = self.eggs.get(s["egg_id"])
+        for task in tasks:
+            eid = task["egg_id"]
+            egg = self.eggs.get(eid)
             if not egg:
                 continue
             yield {"k": "instruct", "egg": egg.id,
-                   "text": "🎯 总指挥指令：" + s["message"]}
+                   "text": "🎯 总指挥指令：" + task["message"]}
             yield {"k": "status", "egg": egg.id, "status": "running"}
             q: asyncio.Queue = asyncio.Queue()
-            # Eggs run in parallel, so a driven egg can't see a peer's *fresh*
-            # output mid-run — we hand it the peer context SNAPSHOT taken at plan
-            # time (each peer's existing views/history). This still lets an egg
-            # critiquing its peer reference that peer's current stance rather than
-            # working blind, even though the runs overlap.
-            peers = [s2["egg_id"] for s2 in plan
-                     if s2["egg_id"] != egg.id and s2["egg_id"] in self.eggs]
-            ctx = plan_ctx if peers else self.neighbor_context(egg.id)
-            pumps.append(asyncio.create_task(_pump(egg.run(s["message"], context=ctx), q)))
-            active[egg.id] = q
-
+            ctx = self._task_context(task, boxes, channels)
+            pumps.append(asyncio.create_task(
+                _pump(egg.run(task["message"], context=ctx), q)))
+            active[egg.id] = (q, task)
         if not active:
-            yield {"k": "end"}
             return
-
-        # Merge all egg streams into one queue tagged by egg_id, then yield in
-        # arrival order. Producer side (each egg's pump + consumer) is fully
-        # parallel; only the yield loop is serial, which is fine.
         merge: asyncio.Queue = asyncio.Queue()
         async def _consumer(eid, q):
             while True:
@@ -583,15 +881,14 @@ class Canvas:
                     await merge.put((eid, _PUMP_DONE))
                     return
                 await merge.put((eid, item))
-        consumers = [asyncio.create_task(_consumer(eid, q)) for eid, q in active.items()]
-        monitor = asyncio.create_task(
-            asyncio.gather(*pumps, *consumers, return_exceptions=True)
-        )
+        consumers = [asyncio.create_task(_consumer(eid, q))
+                     for eid, (q, _t) in active.items()]
+        # NOTE: asyncio.gather returns a Future, not a coroutine — create_task()
+        # would reject it ("a coroutine was expected"); ensure_future accepts both.
+        monitor = asyncio.ensure_future(
+            asyncio.gather(*pumps, *consumers, return_exceptions=True))
         collected = {eid: [] for eid in active}
         finished = 0
-        title_by_id = {eid: self.eggs[eid].title for eid in active}
-        msg_by_id = {s["egg_id"]: s["message"]
-                     for s in plan if s["egg_id"] in active}
         try:
             while finished < len(active):
                 eid, item = await merge.get()
@@ -608,72 +905,12 @@ class Canvas:
                 yield {"k": "egg", "egg": eid, "text": item}
         finally:
             await monitor
-        results = [
-            (title_by_id[eid], msg_by_id[eid], "".join(collected[eid]))
-            for eid in active
-        ]
-
-        # Recap: let the commander summarize completion (fallback to plain text).
-        try:
-            res_txt = "\n\n".join(
-                f"[{title}] 指令：{msg}\n结果：{reply[:600]}"
-                for (title, msg, reply) in results
-            )
-            recap_prompt = (
-                f"用户指令：{text}\n\n各蛋执行情况：\n{res_txt}\n\n"
-                "请用 2-4 句中文总结该指令的完成情况与后续建议。"
-            )
-            async for tok in self.commander.run(recap_prompt, summary):
-                yield {"k": "say", "text": tok}
-        except Exception as ex:  # pragma: no cover
-            yield {"k": "say", "text": f"（总结失败：{ex}）"}
-        yield {"k": "end"}
-
-    async def _commander_plan(self, text, summary, targets):
-        """Ask the commander LLM to break the instruction into per-egg messages."""
-        if not SDK_OK:
-            return self._fake_commander_plan(text, targets)
-        try:
-            target_desc = "\n".join(
-                f"- id={self.eggs[t].id} 标题={self.eggs[t].title} "
-                f"职责={self.eggs[t].prompt}"
-                for t in targets
-            )
-            sys_instr = types.CustomSystemInstructions(text=(
-                "你是总指挥，负责把用户指令拆解为对各个子蛋的具体消息。"
-                "只能使用下面给定的子蛋 id；为每个需要行动的蛋写一条明确、可执行的中文消息；"
-                "无需行动的蛋不要列入。返回结构化 steps（egg_id + message）。"
-            ))
-            caps = types.CapabilitiesConfig(
-                enabled_tools=[], enable_subagents=False,
-                agent_behavior=types.AgentBehavior.MINIMAL,
-            )
-            prompt = (
-                f"可选子蛋：\n{target_desc}\n\n画布状态：\n{summary}\n\n"
-                f"用户指令：{text}\n请给出执行步骤。"
-            )
-            async with Agent(build_agent_config(
-                system_instructions=sys_instr, capabilities=caps,
-                response_schema=CommanderPlan,
-            )) as planner:
-                resp = await planner.chat(prompt)
-                data = await resp.structured_output()
-            steps = data.get("steps") if isinstance(data, dict) else getattr(data, "steps", [])
-            valid = set(targets)
-            out = []
-            for s in steps:
-                eid = s.get("egg_id") if isinstance(s, dict) else s.egg_id
-                message = s.get("message") if isinstance(s, dict) else s.message
-                if eid in valid and message:
-                    out.append({"egg_id": eid, "message": message})
-            return out
-        except Exception as ex:  # pragma: no cover
-            print(f"[commander-plan] failed, using fallback: {ex}")
-            return self._fake_commander_plan(text, targets)
-
-    def _fake_commander_plan(self, text, targets):
-        # No model / planner failed: broadcast the instruction to every target.
-        return [{"egg_id": t, "message": text} for t in targets]
+        for eid, (_q, task) in active.items():
+            out.append({
+                "egg_id": eid, "message": task["message"],
+                "reply": "".join(collected[eid]),
+                "deliver": task.get("deliver") or [],
+            })
 
     # ---- one-click run of selected eggs (parallel / serial by graph) ----
     def _levels(self, targets):
@@ -797,12 +1034,15 @@ class Canvas:
             await asyncio.gather(*tasks)
         yield {"k": "end"}
 
-    def _commander_context(self, targets):
+    def _commander_context(self, targets, mode=None):
         """Graph summary PLUS the selected eggs' historical conversations.
 
         Lets the Commander (总指挥) inherit what each selected egg has actually
         done/decided — not just its prompt — when advising or driving them.
+        ``mode`` overrides the canvas-wide history mode; the commander uses
+        "brief" (user+assistant only, no tool calls / thinking).
         """
+        mode = mode or self.history_mode
         base = self._graph_summary(targets[0] if targets else None)
         if not targets:
             return base
@@ -811,7 +1051,7 @@ class Canvas:
             e = self.eggs.get(t)
             if not e:
                 continue
-            hist = e.history_text(mode=self.history_mode, limit=6000).strip()
+            hist = e.history_text(mode=mode, limit=6000).strip()
             blocks.append(
                 f"### 蛋「{e.title}」（{e.type}）职责：{e.prompt}\n"
                 f"会话历史：\n{hist if hist else '（暂无会话记录）'}"

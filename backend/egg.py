@@ -476,6 +476,43 @@ class EggAgent:
         finally:
             _REASONING["supported"] = got
 
+    async def _heal_conversation(self, err):
+        """Reset a corrupt/invalid SDK conversation so the next chat() starts fresh.
+
+        The SDK persists the LLM session under ``save_dir`` keyed by
+        ``conversation_id``. A turn that produced neither ``content`` nor
+        ``tool_calls`` (e.g. a reasoning-only turn with empty content) gets
+        recorded as an empty assistant message; on the NEXT ``chat()`` the API
+        rejects the whole history with HTTP 400
+        ("Assistant message must contain either 'content' or 'tool_calls'").
+        Dropping ``conversation_id`` forces a brand-new conversation that does not
+        replay the broken history, so the egg recovers instead of erroring forever
+        (which otherwise leaves it stuck "运行中" with an empty box).
+        """
+        e = str(err)
+        if not ("must contain either" in e or "invalid_request" in e
+                or "cannot resume" in e or "not found" in e.lower()):
+            return False
+        try:
+            await self.stop()
+        except Exception:
+            pass
+        self.conversation_id = None
+        self._start_attempted = False
+        self._agent = None
+        self._cm = None
+        try:
+            self._cm, self._agent = await self._open_agent(resume=False)
+            if self._agent is not None:
+                cid = getattr(self._agent, "conversation_id", None)
+                self.conversation_id = cid or uuid.uuid4().hex
+            else:
+                self.conversation_id = uuid.uuid4().hex
+        except Exception:
+            self._cm = None
+            self._agent = None
+        return True
+
     async def run(self, text, context=None):
         """Stream the model's real response for a command inside this egg.
 
@@ -533,6 +570,14 @@ class EggAgent:
                         yield f"\n⚠ 本次运行超时（{_TURN_TIMEOUT:g}s），已停止。\n"
                         return
                     except Exception as ex:
+                        # A corrupt/invalid conversation (e.g. an empty assistant
+                        # message -> HTTP 400) cannot be retried in place; heal it
+                        # (fresh conversation) so the egg recovers instead of
+                        # erroring forever and staying stuck "运行中".
+                        healed = await self._heal_conversation(ex)
+                        if healed and self._agent is None:
+                            yield f"\n⚠ 无法重建会话，已停止：{ex}\n"
+                            return
                         if attempt >= _LLM_BOX.max_attempts:
                             yield f"\n⚠ 请求多次失败，已停止：{ex}\n"
                             return
@@ -573,7 +618,10 @@ class EggAgent:
                         break
                     except asyncio.CancelledError:
                         raise
-                    except Exception:
+                    except Exception as ex:
+                        if await self._heal_conversation(ex) and self._agent is None:
+                            summary = "⚠ 压缩失败：无法重建会话。"
+                            break
                         if attempt >= _LLM_BOX.max_attempts:
                             summary = "⚠ 压缩失败：模型多次无响应。"
                             break

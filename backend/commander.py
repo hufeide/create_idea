@@ -6,6 +6,7 @@ the model's real response; if no model is reachable it reports that explicitly.
 """
 import asyncio
 import datetime
+from pathlib import Path
 
 from .config import build_agent_config, quiet_sdk_start
 
@@ -42,6 +43,7 @@ class Commander:
         # Session binding: when set, the commander's chat is persisted under the
         # session's save_dir and resumes via conversation_id across restarts.
         self.session_dir = session_dir
+        self._commander_dir = None
         # None => first connect lets the SDK create a fresh conversation and assign
         # an id (read back via self._agent.conversation_id); we persist that id so
         # later turns / restarts resume the SAME session. Passing an id absent from
@@ -53,11 +55,20 @@ class Commander:
     def bind_session(self, session_dir, conversation_id=None):
         """Attach this commander to a canvas session so its chat persists/resumes."""
         self.session_dir = session_dir
-        # Keep an already-established id (resume) unless an explicit one is given.
-        if conversation_id is not None:
-            self.conversation_id = conversation_id
+        # Always adopt the given id: an explicit id resumes a saved session, while
+        # None (e.g. a brand-new canvas) starts a FRESH commander conversation
+        # instead of leaking the previous canvas's id into the new one.
+        self.conversation_id = conversation_id
+        # Commander keeps its OWN sub-directory inside the session (separate from
+        # the eggs' shared agent_data), just like each egg has its own worktree.
+        self._commander_dir = (Path(session_dir) / "commander_data"
+                               if session_dir else None)
         # Force a fresh connection on next use with the new session params.
+        # Reset ALL start-related state so a brand-new conversation truly starts
+        # from scratch (no stale error / "already recorded" flags leaking in).
         self._start_attempted = False
+        self._start_error = None
+        self._recorded_init = False
         self._agent = None
         self._cm = None
 
@@ -82,10 +93,9 @@ class Commander:
             )
             self._cm = Agent(build_agent_config(
                 system_instructions=self._si, capabilities=caps,
-                save_dir=(str(self.session_dir / "agent_data")
-                          if self.session_dir else None),
+                save_dir=(str(self._commander_dir) if self._commander_dir else None),
                 conversation_id=(self.conversation_id
-                                 if self.session_dir and self.conversation_id
+                                 if self._commander_dir and self.conversation_id
                                  else None),
             ))
             self._agent = await self._cm.__aenter__()
@@ -163,6 +173,28 @@ class Commander:
             self.transcript[-1]["text"] += text
         else:
             self._record("assistant", "thought", text=text)
+
+    def history_text(self, limit=None):
+        """Chronological user+assistant dialogue ONLY.
+
+        Tool calls, tool results, thinking and status entries are deliberately
+        excluded — the commander/egg channels carry plain conversation context.
+        """
+        lines = []
+        for r in self.transcript:
+            if r.get("role") not in ("user", "assistant"):
+                continue
+            if r.get("kind") != "text":
+                continue
+            text = (r.get("text") or "").strip()
+            if not text:
+                continue
+            who = "用户" if r.get("role") == "user" else "总指挥"
+            lines.append(f"{who}：{text}")
+        out = "\n".join(lines)
+        if limit and len(out) > limit:
+            out = "…（更早的历史略去）\n" + out[-limit:]
+        return out
 
     async def run(self, text, graph_summary):
         prompt = f"{graph_summary}\n\n用户协调指令：{text}\n请给出协调/修改建议。"
