@@ -259,6 +259,19 @@ function handle(m){
     case 'reasoning': $('#reasonChk').checked=!!m.enabled; break;
     case 'token': appendToken(m.eggId, m.text); if(traceKey===m.eggId) refreshTraceThrottled(); break;
     case 'msg': { const e=state.eggs[m.eggId]; if(e) pushMsg(e, m.role||'user', m.text); break; }
+    case 'plan': {
+      const box=document.createElement('div'); box.className='c-plan';
+      const h=document.createElement('div'); h.className='c-plan-h';
+      h.textContent='🗺 总指挥规划图';
+      box.appendChild(h);
+      (m.steps||[]).forEach(s=>{
+        const row=document.createElement('div'); row.className='c-plan-step';
+        const b=document.createElement('b'); b.textContent=s.title||s.egg_id;
+        const t=document.createElement('span'); t.textContent='：'+s.message;
+        row.appendChild(b); row.appendChild(t); box.appendChild(row);
+      });
+      $('#cmdBody').appendChild(box); $('#cmdBody').scrollTop=$('#cmdBody').scrollHeight; break;
+    }
     case 'status': { const e=state.eggs[m.eggId]; if(e) setEggStatus(e, m.status); break; }
     case 'done': {
       delete activeStream[m.eggId];
