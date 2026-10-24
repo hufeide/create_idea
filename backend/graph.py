@@ -43,6 +43,12 @@ _MAX_ROUNDS = int(os.environ.get("COMMANDER_MAX_ROUNDS", "24"))
 # commander is forced to wrap up (guards against an endless no-op loop).
 _MAX_IDLE = int(os.environ.get("COMMANDER_MAX_IDLE", "3"))
 
+# Verbs that mean "this task must READ another egg's conclusion" (a real
+# dependency).  A bare mention ("预判反方的主要反驳") is NOT one of them.
+_CONSUME_VERBS = ("综合", "评判", "比较", "阅读", "基于", "依据", "参考",
+                   "权衡", "裁决", "总结", "结合", "汇总", "整合", "评估",
+                   "归纳", "复核", "批改", "审阅")
+
 
 async def _pump(agen, q):
     """Drain an async generator into a queue on its OWN task.
@@ -639,6 +645,15 @@ class Canvas:
                         bg.remove(dec)
                     tasks = [t for t in (decision.get("tasks") or [])
                              if t.get("egg_id") in self.eggs]
+                    # One task per egg per round: the model sometimes emits
+                    # several variants for the same egg (e.g. three "裁判任务").
+                    _seen, _uniq = set(), []
+                    for t in tasks:
+                        if t["egg_id"] in _seen:
+                            continue
+                        _seen.add(t["egg_id"])
+                        _uniq.append(t)
+                    tasks = _uniq
                     if decision.get("action") == "finish":
                         # 只有真正完成才跳出循环。
                         final_summary = decision.get("summary") or ""
@@ -924,18 +939,54 @@ class Canvas:
         head = re.split(r"[-—_、,，\s:：()（）]", title)[0] or title
         return head[:2] if len(head) >= 2 else head
 
-    def _references(self, msg, keyword):
-        """True when ``msg`` talks ABOUT the egg identified by ``keyword``.
+    def _references(self, msg, keyword, egg_id=None):
+        """True when ``msg`` tells this egg to READ another egg's conclusion.
 
-        A self-reference ("你是正方辩手，…") does NOT count — the egg is not
-        depending on itself.
+        Two ways the commander points at a peer:
+          * explicitly — "正方(e1)与反方(e2)" (strong signal);
+          * by role name next to a consuming verb — "综合正反双方的论证".
+        A mere mention ("预判反方的主要反驳") is NOT a dependency, and a
+        self-reference ("你是正方辩手，…") never is either.
         """
-        if not keyword or keyword not in msg:
+        if not keyword:
+            return False
+        if egg_id:
+            # An EXPLICIT id reference is a strong signal on its own:
+            #   "正方(e1)"  "正方 e1"  "来自 e1"  "蛋e1"  "e1 的论证"
+            pat = r"[（(]\s*" + re.escape(egg_id) + r"\s*[)）]"
+            if re.search(pat, msg):
+                return True
+            near = r"[^。！？；\n]{0,24}?"
+            if re.search(re.escape(keyword) + near + re.escape(egg_id), msg):
+                return True
+            if re.search(re.escape(egg_id) + near + re.escape(keyword), msg):
+                return True
+            if re.search(r"(蛋|源|来自|由)\s*[:：]?\s*" + re.escape(egg_id), msg):
+                return True
+        idx = msg.find(keyword)
+        if idx < 0:
             return False
         m = re.match(r"\s*你是([^，。：:,\n]{0,14})", msg)
         if m and keyword in m.group(1):
             return False      # it is talking about ITSELF
-        return True
+        # The consuming verb must live in the SAME clause: "需综合正方与反方
+        # 双方论证" covers both roles, while "预判反方的主要反驳" does not.
+        clause = self._clause(msg, idx)
+        return any(v in clause for v in _CONSUME_VERBS)
+
+    def _clause(self, msg, idx):
+        """The sentence-ish span of ``msg`` that contains character ``idx``."""
+        start = 0
+        for sep in "。！？；\n":
+            p = msg.rfind(sep, 0, idx)
+            if p != -1:
+                start = max(start, p + 1)
+        end = len(msg)
+        for sep in "。！？；\n":
+            p = msg.find(sep, idx)
+            if p != -1:
+                end = min(end, p)
+        return msg[start:end]
 
     def _resolve_dependencies(self, tasks, boxes=None):
         """Fill in the dependencies the commander did not declare.
@@ -958,7 +1009,7 @@ class Canvas:
             for eid in self.eggs:
                 if eid == t["egg_id"]:
                     continue
-                if self._references(msg, self._role_hint(eid)):
+                if self._references(msg, self._role_hint(eid), eid):
                     refs.add(eid)
             for u in tasks:
                 if u["egg_id"] in refs:
@@ -969,16 +1020,16 @@ class Canvas:
                 if r in boxes and r != t["egg_id"]:
                     deliver.add(r)
             t["deliver"] = sorted(deliver)
-        # Break dependency cycles (A waits for B and B waits for A): the one
-        # that comes FIRST in the list keeps its dependency, the other runs.
-        for t in tasks:
-            for u in tasks:
-                if u["egg_id"] == t["egg_id"]:
+        # Break dependency cycles (A waits for B and B waits for A): the LATER
+        # task keeps waiting for the earlier one, the earlier one just runs.
+        for i, t in enumerate(tasks):
+            for j, u in enumerate(tasks):
+                if i == j:
                     continue
                 if (u["egg_id"] in deps[t["egg_id"]]
                         and t["egg_id"] in deps[u["egg_id"]]
-                        and tasks.index(u) > tasks.index(t)):
-                    deps[u["egg_id"]].discard(t["egg_id"])
+                        and j > i):
+                    deps[t["egg_id"]].discard(u["egg_id"])
         for t in tasks:
             t["depends_on"] = [d for d in deps[t["egg_id"]] if d in ids]
         return deps
@@ -996,10 +1047,13 @@ class Canvas:
         """
         self._resolve_dependencies(tasks, boxes)
         ids = {t["egg_id"] for t in tasks}
+        boxes = boxes or {}
         runnable, deferred = [], []
         for t in tasks:
+            # A dependency that already has a conclusion (and is not part of
+            # THIS round) is satisfied -> it does not defer the task.
             deps = [d for d in (t.get("depends_on") or [])
-                    if d in ids and d != t["egg_id"]]
+                    if d in ids and d != t["egg_id"] and d not in boxes]
             if deps:
                 deferred.append(t)
             else:
@@ -1183,6 +1237,8 @@ class Canvas:
                 "   · 【监控告警】：运行超时/长时间无输出的蛋需要你裁决。\n"
                 "3) 一次只给本轮的指令。若本轮这些蛋互不依赖，可同时给多个（并行）；"
                 "若需要等某个结果才能定下一步，就只给一个（串行）。\n"
+                "3a) 同一只蛋在一轮里只给一个任务；已经产出结论的蛋，除非指令明确要求"
+                "它继续推进，否则不要重复派它。\n"
                 "3b) 【时序/依赖】有先后关系的任务必须用 depends_on 声明依赖的蛋 id，"
                 "系统会自动把它推迟到依赖完成后的下一轮执行。例如辩论：正方与反方"
                 "互不依赖，同轮并行；裁判依赖双方，depends_on 写 [\"正方id\", \"反方id\"]，"
