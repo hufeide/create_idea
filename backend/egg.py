@@ -26,21 +26,16 @@ except Exception:  # pragma: no cover
 
 
 class _LLMBox:
-    """Serializes model chat() calls across ALL eggs.
+    """Holds retry policy for model chat() calls.
 
-    The local backend serves only ONE request at a time, so when several eggs
-    "run in parallel" their chat() calls would collide and the extras time out /
-    get cancelled. Eggs acquire ``_LLM_BOX.lock`` around their chat so requests
-    run one-by-one, and retry failed attempts every ``delay`` seconds (see the
-    retry loop in ``EggAgent.run``).
-
-    NOTE: the lock is held directly inside ``EggAgent.run`` (NOT in a nested
-    generator) and consumers ``aclose()`` the run generator on exit, so an
-    interrupt releases the lock immediately instead of waiting for GC.
+    Concurrency is governed PER-EGG by ``EggAgent._lock`` (so a single egg never
+    runs two model turns at once), which lets DIFFERENT eggs truly run in
+    parallel. We deliberately do NOT serialize chat() across all eggs — modern
+    OpenAI-compatible backends handle concurrent requests. Failed attempts are
+    retried every ``delay`` seconds (see the retry loop in ``EggAgent.run``).
     """
 
     def __init__(self, max_attempts=6, delay=1.0):
-        self.lock = asyncio.Lock()
         self.max_attempts = max_attempts
         self.delay = delay
 
@@ -142,6 +137,7 @@ class EggAgent:
             "id": self.id, "title": self.title, "prompt": self.prompt,
             "type": self.type, "x": self.x, "y": self.y, "parent": self.parent,
             "conversation_id": self.conversation_id,
+            "running": self.busy,
         }
 
     # ---- SDK lifecycle ----
@@ -399,7 +395,7 @@ class EggAgent:
         if t is not None and not t.done():
             t.cancel()
 
-    async def _chat_once(self, text):
+    async def _chat_once(self, text, context=None):
         """One chat attempt: stream the FULL semantic chunk stream.
 
         Iterate ``resp.chunks`` (NOT ``async for chunk in resp``) — the latter's
@@ -407,6 +403,17 @@ class EggAgent:
         ``ToolCall`` and ``ToolResult``. Using the unfiltered stream lets the
         trace capture 💭 thoughts and 🔧 tool calls/results.
         """
+        if context:
+            # Prepend the connected eggs' conversation history so this egg can
+            # reference what its neighbours have actually done/decided. The SDK's
+            # compaction keeps the transcript from ballooning across turns.
+            text = (
+                "【参考上下文：以下是在本次任务中相关的其他蛋的会话历史/观点，"
+                "仅供了解背景】\n"
+                f"{context}\n"
+                "【以上为参考上下文。以下是用户给你的指令】\n"
+                f"{text}"
+            )
         resp = await self._agent.chat(text)
         self._active_resp = resp
         try:
@@ -469,7 +476,7 @@ class EggAgent:
         finally:
             _REASONING["supported"] = got
 
-    async def run(self, text):
+    async def run(self, text, context=None):
         """Stream the model's real response for a command inside this egg.
 
         The chat runs under the shared box lock (one model request at a time)
@@ -497,29 +504,27 @@ class EggAgent:
                 # the SDK harness, so we capture reasoning_content directly).
                 if (BACKEND == "openai" and _REASONING["enabled"]
                         and _REASONING["supported"] is not False):
-                    async with _LLM_BOX.lock:      # one model request at a time
-                        try:
-                            async with asyncio.timeout(_TURN_TIMEOUT):
-                                async for rc in self._capture_reasoning(text):
-                                    self._record_thought(rc)
-                                    yield f"💭 {rc}"
-                        except asyncio.TimeoutError:
-                            yield f"\n⚠ 思考超时（{_TURN_TIMEOUT:g}s），已停止。\n"
-                            return
+                    try:
+                        async with asyncio.timeout(_TURN_TIMEOUT):
+                            async for rc in self._capture_reasoning(text):
+                                self._record_thought(rc)
+                                yield f"💭 {rc}"
+                    except asyncio.TimeoutError:
+                        yield f"\n⚠ 思考超时（{_TURN_TIMEOUT:g}s），已停止。\n"
+                        return
                 for attempt in range(1, _LLM_BOX.max_attempts + 1):
                     try:
-                        async with _LLM_BOX.lock:      # one chat at a time
-                            chat = self._chat_once(text)
+                        chat = self._chat_once(text, context=context)
+                        try:
+                            async with asyncio.timeout(_TURN_TIMEOUT):
+                                async for t in chat:
+                                    yield t
+                        finally:
+                            # stop the model call + free locks on interrupt
                             try:
-                                async with asyncio.timeout(_TURN_TIMEOUT):
-                                    async for t in chat:
-                                        yield t
-                            finally:
-                                # stop the model call + free locks on interrupt
-                                try:
-                                    await chat.aclose()
-                                except Exception:  # pragma: no cover
-                                    pass
+                                await chat.aclose()
+                            except Exception:  # pragma: no cover
+                                pass
                         self._sync_conv_id()   # persist the real conversation id
                         return
                     except asyncio.CancelledError:
@@ -556,16 +561,15 @@ class EggAgent:
                 summary = None
                 for attempt in range(1, _LLM_BOX.max_attempts + 1):
                     try:
-                        async with _LLM_BOX.lock:
-                            resp = await self._agent.chat(
-                                "将我们到目前为止的对话压缩为一段简洁的规格说明"
-                                "（markdown），只保留关键决策与产出。"
-                            )
-                            self._active_resp = resp
-                            try:
-                                summary = await resp.text()
-                            finally:
-                                self._active_resp = None
+                        resp = await self._agent.chat(
+                            "将我们到目前为止的对话压缩为一段简洁的规格说明"
+                            "（markdown），只保留关键决策与产出。"
+                        )
+                        self._active_resp = resp
+                        try:
+                            summary = await resp.text()
+                        finally:
+                            self._active_resp = None
                         break
                     except asyncio.CancelledError:
                         raise

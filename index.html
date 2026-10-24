@@ -81,6 +81,10 @@
   #commander .c-head .dot{width:8px;height:8px;border-radius:50%;background:var(--accent2);box-shadow:0 0 8px var(--accent2);}
   #commander .c-body{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:8px;}
   #commander .c-msg{font-size:12px;line-height:1.5;padding:8px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);}
+  #commander .c-plan{font-size:12px;line-height:1.5;padding:8px 10px;border-radius:8px;background:#1b2436;border:1px solid #2c3a52;margin:2px 0;}
+  #commander .c-plan-h{font-weight:700;color:#7fd1ff;margin-bottom:4px;}
+  #commander .c-plan-step{color:#cdd6e4;line-height:1.6;}
+  #commander .c-plan-step b{color:#fff;}
   #commander .c-foot{padding:10px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:6px;}
   #commander select{width:100%;}
 
@@ -231,9 +235,18 @@ function edgePath(x1,y1,x2,y2){ const c=Math.max(40,Math.abs(x2-x1)/2); return `
 
 /* ---------- websocket ---------- */
 let ws;
+let currentSessionId = '';
 function connect(){
   ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = ()=>{ $('#status').textContent='已连接'; send({type:'sync'}); send({type:'listSessions'}); };
+  ws.onopen = ()=>{
+  $('#status').textContent='已连接';
+  send({type:'sync'}); send({type:'listSessions'});
+  // A dropped connection loses the in-flight realtime stream (tokens + done),
+  // leaving eggs blank / stuck "运行中". Re-loading the current session on
+  // (re)connect backfills every egg's box from the backend transcript and
+  // resets run state to the backend's truth.
+  if(currentSessionId) send({type:'loadSession', sessionId: currentSessionId});
+};
   ws.onclose = ()=>{ $('#status').textContent='断开，重连中…'; setTimeout(connect, 1500); };
   ws.onmessage = ev => handle(JSON.parse(ev.data));
 }
@@ -263,7 +276,7 @@ function handle(m){
     case 'error': toast('错误: '+m.message); restoreGenBtn(); break;
     case 'sessions': fillSessionSel(m.sessions); break;
     case 'history': applyHistory(m.eggId, m.transcript); break;
-    case 'session': $('#sessionSel').value = m.sessionId || ''; break;
+    case 'session': currentSessionId = m.sessionId || ''; $('#sessionSel').value = currentSessionId; break;
   }
 }
 
@@ -455,7 +468,7 @@ function interruptEgg(egg){
 function syncGraph(eggs, edges){
   const present=new Set(eggs.map(e=>e.id));
   for(const id of Object.keys(state.eggs)){
-    if(!present.has(id)){ state.eggs[id].el.remove(); delete state.eggs[id]; }
+    if(!present.has(id)){ state.eggs[id].el.remove(); delete state.eggs[id]; delete activeStream[id]; }
   }
   for(const e of eggs){
     const ex=state.eggs[e.id];
@@ -465,6 +478,10 @@ function syncGraph(eggs, edges){
       ex.el.querySelector('.title').value=e.title;
       ex.el.querySelector('.prompt').value=e.prompt;
       ex.el.querySelector('.badge').textContent=e.type;
+      // Re-sync run state from the backend: a stale "运行中" left behind by a
+      // dropped WS stream is cleared here because the backend's egg.busy is the
+      // source of truth (it is False once the run actually finished).
+      setEggStatus(ex, e.running ? 'running' : 'idle');
     } else {
       createEggEl(e);
     }
@@ -509,7 +526,7 @@ function appendToken(eggId, text){
     return;
   }
   let body=activeStream[eggId];
-  if(!body){
+  if(!body || !body.isConnected){
     if(eggId==='commander'){
       const d=document.createElement('div'); d.className='c-msg';
       d.innerHTML='<b>总指挥：</b><span class="b"></span>';

@@ -255,6 +255,34 @@ class Canvas:
             "reasoning": reasoning_capture_state(),
         }
 
+    def neighbor_context(self, eid):
+        """Text snapshot of the conversation histories of eggs directly connected
+        to ``eid`` (by an edge, either direction), so a normal chat with ``eid``
+        can reference what its neighbours have actually done/decided. Returns ""
+        when there are no connected eggs or none have history yet.
+        """
+        e = self.eggs.get(eid)
+        if not e:
+            return ""
+        nbr_ids = set()
+        for ed in self.edges:
+            if ed["from"] == eid and ed["to"] in self.eggs:
+                nbr_ids.add(ed["to"])
+            elif ed["to"] == eid and ed["from"] in self.eggs:
+                nbr_ids.add(ed["from"])
+        if not nbr_ids:
+            return ""
+        blocks = []
+        for nid in nbr_ids:
+            n = self.eggs[nid]
+            hist = n.history_text(mode=self.history_mode, limit=3000).strip()
+            blocks.append(
+                f"### 相连的蛋「{n.title}」（{n.type}）职责：{n.prompt}\n"
+                f"会话历史：\n{hist if hist else '（暂无会话记录）'}"
+            )
+        return ("以下是与你直接相连的蛋的会话历史（仅供参考，用于了解上下文）：\n\n"
+                + "\n\n".join(blocks))
+
     # ---- spawning ----
     async def _spawn(self, title, prompt, type_, x, y, subagents=None, parent=None):
         eid = self._new_id()
@@ -503,7 +531,24 @@ class Canvas:
             if s["egg_id"] in self.eggs:
                 yield {"k": "status", "egg": s["egg_id"], "status": "planned"}
 
-        results = []
+        # ---- plan view (规划图) ----
+        plan_steps = [
+            {"egg_id": s["egg_id"],
+             "title": self.eggs[s["egg_id"]].title if s["egg_id"] in self.eggs else s["egg_id"],
+             "message": s["message"]}
+            for s in plan if s["egg_id"] in self.eggs
+        ]
+        yield {"k": "plan", "steps": plan_steps}
+
+        # ---- parallel execution ----
+        # Every selected egg is launched at once; their reply tokens stream in
+        # concurrently and are yielded as they arrive (interleaved per egg), so the
+        # eggs truly run in parallel instead of one-by-one.
+        active = {}                       # egg_id -> its pump output queue
+        pumps = []
+        plan_ctx = self._commander_context(
+            [s["egg_id"] for s in plan if s["egg_id"] in self.eggs]
+        )
         for s in plan:
             egg = self.eggs.get(s["egg_id"])
             if not egg:
@@ -511,22 +556,62 @@ class Canvas:
             yield {"k": "instruct", "egg": egg.id,
                    "text": "🎯 总指挥指令：" + s["message"]}
             yield {"k": "status", "egg": egg.id, "status": "running"}
-            collected = []
             q: asyncio.Queue = asyncio.Queue()
-            pump = asyncio.create_task(_pump(egg.run(s["message"]), q))
+            # Eggs run in parallel, so a driven egg can't see a peer's *fresh*
+            # output mid-run — we hand it the peer context SNAPSHOT taken at plan
+            # time (each peer's existing views/history). This still lets an egg
+            # critiquing its peer reference that peer's current stance rather than
+            # working blind, even though the runs overlap.
+            peers = [s2["egg_id"] for s2 in plan
+                     if s2["egg_id"] != egg.id and s2["egg_id"] in self.eggs]
+            ctx = plan_ctx if peers else self.neighbor_context(egg.id)
+            pumps.append(asyncio.create_task(_pump(egg.run(s["message"], context=ctx), q)))
+            active[egg.id] = q
+
+        if not active:
+            yield {"k": "end"}
+            return
+
+        # Merge all egg streams into one queue tagged by egg_id, then yield in
+        # arrival order. Producer side (each egg's pump + consumer) is fully
+        # parallel; only the yield loop is serial, which is fine.
+        merge: asyncio.Queue = asyncio.Queue()
+        async def _consumer(eid, q):
             while True:
                 item = await q.get()
                 if item is _PUMP_DONE:
-                    break
+                    await merge.put((eid, _PUMP_DONE))
+                    return
+                await merge.put((eid, item))
+        consumers = [asyncio.create_task(_consumer(eid, q)) for eid, q in active.items()]
+        monitor = asyncio.create_task(
+            asyncio.gather(*pumps, *consumers, return_exceptions=True)
+        )
+        collected = {eid: [] for eid in active}
+        finished = 0
+        title_by_id = {eid: self.eggs[eid].title for eid in active}
+        msg_by_id = {s["egg_id"]: s["message"]
+                     for s in plan if s["egg_id"] in active}
+        try:
+            while finished < len(active):
+                eid, item = await merge.get()
+                if item is _PUMP_DONE:
+                    yield {"k": "status", "egg": eid, "status": "idle"}
+                    yield {"k": "end_egg", "egg": eid}
+                    finished += 1
+                    continue
                 if isinstance(item, tuple) and item and item[0] == "__err__":
-                    yield {"k": "egg", "egg": egg.id,
+                    yield {"k": "egg", "egg": eid,
                            "text": f"\n（执行出错：{item[1]}）"}
                     continue
-                collected.append(item)
-                yield {"k": "egg", "egg": egg.id, "text": item}
-            yield {"k": "status", "egg": egg.id, "status": "idle"}
-            yield {"k": "end_egg", "egg": egg.id}
-            results.append((egg.title, s["message"], "".join(collected)))
+                collected[eid].append(item)
+                yield {"k": "egg", "egg": eid, "text": item}
+        finally:
+            await monitor
+        results = [
+            (title_by_id[eid], msg_by_id[eid], "".join(collected[eid]))
+            for eid in active
+        ]
 
         # Recap: let the commander summarize completion (fallback to plain text).
         try:

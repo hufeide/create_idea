@@ -12,6 +12,10 @@ from .egg import reasoning_capture_state
 
 FRONTEND = Path(__file__).resolve().parent.parent / "index.html"
 
+# In-flight produce() tasks (one per "command"/"commander" run). Kept in a set so
+# fire-and-forget tasks aren't garbage-collected before they finish.
+TASKS = set()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -123,6 +127,8 @@ async def _stream_events(ws: WebSocket, agen):
                                 "text": ev["text"]})
         elif k == "egg":
             await ws.send_json({"type": "token", "eggId": ev["egg"], "text": ev["text"]})
+        elif k == "plan":
+            await ws.send_json({"type": "plan", "steps": ev["steps"]})
         elif k == "status":
             await ws.send_json({"type": "status", "eggId": ev["egg"],
                                 "status": ev["status"]})
@@ -159,10 +165,13 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
         egg = canvas.eggs.get(eid)
         if not egg:
             return
+        # Reference the connected eggs' session histories so this egg can build on
+        # what its neighbours have actually done/decided.
+        ctx = canvas.neighbor_context(eid)
 
         async def produce():
             await ws.send_json({"type": "status", "eggId": eid, "status": "running"})
-            gen = egg.run(msg["text"])
+            gen = egg.run(msg["text"], context=ctx)
             try:
                 async for tok in gen:
                     await ws.send_json({"type": "token", "eggId": eid, "text": tok})
@@ -185,9 +194,13 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
                 except Exception:  # pragma: no cover
                     pass
 
-        # Run in a dedicated task so the stop button (egg.interrupt) cancels only
-        # this run, never the websocket connection itself.
-        await asyncio.create_task(produce())
+        # Fire-and-forget: run in a dedicated task so the websocket read-loop is
+        # NOT blocked while this egg streams. Two eggs commanded "in parallel"
+        # each get their own task and truly run concurrently (the stop button's
+        # egg.interrupt cancels only this task, never the connection).
+        task = asyncio.create_task(produce())
+        TASKS.add(task)
+        task.add_done_callback(TASKS.discard)
 
     elif t == "interrupt":
         egg = canvas.eggs.get(msg.get("eggId"))
