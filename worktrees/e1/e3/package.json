@@ -1,0 +1,9 @@
+{
+  "name": "weather-card",
+  "version": "1.0.0",
+  "description": "Weather data rendered as a friendly card UI",
+  "type": "module",
+  "scripts": {
+    "test": "node test/weather-card.test.js"
+  }
+}

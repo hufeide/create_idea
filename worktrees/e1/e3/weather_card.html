@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>天气卡片</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .weather-card {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+            max-width: 380px;
+            width: 100%;
+        }
+
+        .card-header {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            padding: 30px 25px 20px;
+            position: relative;
+        }
+
+        .card-header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+            animation: shimmer 3s infinite;
+        }
+
+        @keyframes shimmer {
+            0%, 100% { transform: rotate(0deg); }
+            50% { transform: rotate(180deg); }
+        }
+
+        .location {
+            position: relative;
+            z-index: 1;
+            color: white;
+            margin-bottom: 10px;
+        }
+
+        .location h2 {
+            font-size: 28px;
+            font-weight: 600;
+        }
+
+        .location p {
+            font-size: 14px;
+            opacity: 0.9;
+            margin-top: 5px;
+        }
+
+        .weather-main {
+            position: relative;
+            z-index: 1;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 15px;
+        }
+
+        .weather-icon {
+            font-size: 60px;
+        }
+
+        .temperature {
+            text-align: right;
+        }
+
+        .temp-value {
+            font-size: 42px;
+            font-weight: 300;
+            line-height: 1;
+        }
+
+        .temp-unit {
+            font-size: 18px;
+            margin-top: 5px;
+            opacity: 0.9;
+        }
+
+        .weather-description {
+            position: relative;
+            z-index: 1;
+            font-size: 16px;
+            margin-top: 8px;
+            text-transform: capitalize;
+        }
+
+        .card-body {
+            padding: 25px;
+        }
+
+        .weather-details {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .detail-item {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 15px;
+            text-align: center;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .detail-item:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .detail-icon {
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+
+        .detail-label {
+            font-size: 12px;
+            color: #6c757d;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .detail-value {
+            font-size: 16px;
+            color: #212529;
+            font-weight: 600;
+        }
+
+        .hourly-forecast {
+            margin-top: 20px;
+        }
+
+        .hourly-title {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #212529;
+        }
+
+        .hourly-list {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .hourly-item {
+            flex: 1;
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 12px 8px;
+            text-align: center;
+        }
+
+        .hourly-time {
+            font-size: 12px;
+            color: #6c757d;
+            margin-bottom: 5px;
+        }
+
+        .hourly-icon {
+            font-size: 24px;
+            margin-bottom: 5px;
+        }
+
+        .hourly-temp {
+            font-size: 14px;
+            font-weight: 600;
+            color: #212529;
+        }
+
+        .uv-index {
+            margin-top: 20px;
+            padding: 15px;
+            background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .uv-text {
+            flex: 1;
+        }
+
+        .uv-label {
+            font-size: 12px;
+            color: #e65100;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        .uv-value {
+            font-size: 24px;
+            color: #e65100;
+            font-weight: 700;
+        }
+
+        .uv-desc {
+            font-size: 12px;
+            color: #e65100;
+            margin-top: 3px;
+        }
+
+        .card-footer {
+            background: #f8f9fa;
+            padding: 15px 25px;
+            border-top: 1px solid #e9ecef;
+        }
+
+        .update-time {
+            font-size: 12px;
+            color: #6c757d;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        @media (max-width: 480px) {
+            .weather-card {
+                border-radius: 15px;
+            }
+
+            .location h2 {
+                font-size: 24px;
+            }
+
+            .temp-value {
+                font-size: 36px;
+            }
+
+            .weather-details {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="weather-card">
+        <div class="card-header">
+            <div class="location">
+                <h2 id="city">北京市</h2>
+                <p id="date">2026 年 10 月 24 日 星期六</p>
+            </div>
+            <div class="weather-main">
+                <div class="weather-icon" id="main-icon">☀️</div>
+                <div class="temperature">
+                    <div class="temp-value" id="temp">24</div>
+                    <div class="temp-unit">°C</div>
+                </div>
+            </div>
+            <div class="weather-description" id="description">晴朗</div>
+        </div>
+        <div class="card-body">
+            <div class="weather-details">
+                <div class="detail-item">
+                    <div class="detail-icon">💨</div>
+                    <div class="detail-label">风速</div>
+                    <div class="detail-value" id="wind">12 km/h</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-icon">💧</div>
+                    <div class="detail-label">湿度</div>
+                    <div class="detail-value" id="humidity">45%</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-icon">🌡️</div>
+                    <div class="detail-label">体感</div>
+                    <div class="detail-value" id="feels-like">23°C</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-icon">👁️</div>
+                    <div class="detail-label">能见度</div>
+                    <div class="detail-value" id="visibility">10 km</div>
+                </div>
+            </div>
+            
+            <div class="hourly-forecast">
+                <div class="hourly-title">未来 3 小时预报</div>
+                <div class="hourly-list" id="hourly-list">
+                    <div class="hourly-item">
+                        <div class="hourly-icon">☀️</div>
+                        <div class="hourly-time">18:00</div>
+                        <div class="hourly-temp">24°C</div>
+                    </div>
+                    <div class="hourly-item">
+                        <div class="hourly-icon">🌤️</div>
+                        <div class="hourly-time">19:00</div>
+                        <div class="hourly-temp">23°C</div>
+                    </div>
+                    <div class="hourly-item">
+                        <div class="hourly-icon">🌙</div>
+                        <div class="hourly-time">20:00</div>
+                        <div class="hourly-temp">22°C</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="uv-index">
+                <div class="uv-text">
+                    <div class="uv-label">紫外线指数</div>
+                    <div class="uv-desc">中等强度 - 建议防晒</div>
+                </div>
+                <div class="uv-value">5</div>
+            </div>
+        </div>
+        <div class="card-footer">
+            <div class="update-time">
+                <span>🕐</span>
+                <span id="update-time">数据更新于：刚刚</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 当前时间
+        const now = new Date();
+        
+        // 格式化日期
+        document.getElementById('date').textContent = 
+            `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ${getWeekday()}`;
+        
+        // 格式化更新时间
+        document.getElementById('update-time').textContent = 
+            `数据更新于：${now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
+        
+        function getWeekday() {
+            const days = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
+            return days[now.getDay()];
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,60 @@
+{
+  "source": "Open-Meteo API",
+  "city": "Shanghai",
+  "country": "China",
+  "coordinates": {
+    "latitude": 31.22222,
+    "longitude": 121.45806
+  },
+  "current_weather": {
+    "observed_at": "2026-10-24T15:15",
+    "temperature_c": 20.7,
+    "feels_like_c": 21.6,
+    "humidity_pct": 87,
+    "wind_speed_mps": 15.2,
+    "precipitation_mm": 0.1,
+    "weather_code": 51
+  },
+  "daily_forecast": [
+    {
+      "date": "2026-10-24",
+      "weather": "中阵雨",
+      "weather_code": 81,
+      "temp_max_c": 20.9,
+      "temp_min_c": 18.1,
+      "feels_like_max_c": 22.5,
+      "feels_like_min_c": 18.5,
+      "humidity_pct": 91,
+      "wind_speed_max_mps": 21.7,
+      "precip_prob_pct": 100,
+      "precipitation_mm": 36.0
+    },
+    {
+      "date": "2026-10-25",
+      "weather": "毛毛雨",
+      "weather_code": 51,
+      "temp_max_c": 23.5,
+      "temp_min_c": 17.9,
+      "feels_like_max_c": 23.3,
+      "feels_like_min_c": 18.3,
+      "humidity_pct": 81,
+      "wind_speed_max_mps": 22.7,
+      "precip_prob_pct": 54,
+      "precipitation_mm": 0.3
+    },
+    {
+      "date": "2026-10-26",
+      "weather": "少云",
+      "weather_code": 2,
+      "temp_max_c": 22.8,
+      "temp_min_c": 16.5,
+      "feels_like_max_c": 23.5,
+      "feels_like_min_c": 16.5,
+      "humidity_pct": 79,
+      "wind_speed_max_mps": 12.8,
+      "precip_prob_pct": 10,
+      "precipitation_mm": 0.0
+    }
+  ],
+  "timezone": "Asia/Shanghai"
+}

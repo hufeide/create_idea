@@ -1,0 +1,2 @@
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-24T08:12:36Z","content":"<USER_REQUEST>\n用一句话介绍你能做什么\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-24T16:12:36+08:00.\n</ADDITIONAL_METADATA>"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-24T08:12:36Z","content":"我 Antigravity 是一个多功能智能代理模块，可以帮你编写代码、管理后台任务、运行命令行操作，并回答技术问题。"}

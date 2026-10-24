@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Weather Card UI</title>
+</head>
+<body>
+  <div class="hero"><h1>Weather Card UI</h1><p>Weather data rendered as friendly cards — sample data from sample.json.</p></div>
+  <main id="weather"></main>
+  <script type="module">
+    import { renderWeatherGridToElement } from '/home/administator/workspace/create_idea/worktrees/e1/e3/src/weather-card.js';
+    import data from '/home/administator/workspace/create_idea/worktrees/e1/e3/data/sample.json';
+    renderWeatherGridToElement(document.getElementById('weather'), data);
+  </script>
+
+
+</body></html>
