@@ -256,7 +256,12 @@ class EggAgent:
             conversation_id=(self.conversation_id if resume else None),
             capabilities=caps,
             policies=[policy.allow_all()],
-            subagents=None,
+            # Re-enable the "composed egg inherits its sources as cloud
+            # sub-agents" feature: combine() builds SubagentConfig objects and
+            # hands them to _spawn -> self.subagents. build_agent_config drops
+            # this key for backends that don't accept it, so passing it here is
+            # safe everywhere.
+            subagents=self.subagents,
             hook_runner=self._make_hook_runner(),
         )
 
@@ -602,42 +607,48 @@ class EggAgent:
                         self._turn_payload = False
                         chat = self._chat_once(text, context=context)
                         got_text = False
-                        try:
-                            # Stream with a STALL watchdog: if no chunk arrives
-                            # for _STALL_TIMEOUT the model/server has gone quiet
-                            # (often a truncated/aborted upstream turn). Abort so
-                            # the egg leaves "运行中" and the panel/trace stop
-                            # looking frozen.
-                            agen = chat.__aiter__()
-                            while True:
-                                try:
-                                    t = await asyncio.wait_for(
-                                        agen.__anext__(),
-                                        timeout=_STALL_TIMEOUT)
-                                except StopAsyncIteration:
-                                    break
-                                except asyncio.TimeoutError:
-                                    yield (f"\n⚠ 模型流静默超过 {_STALL_TIMEOUT:g}s，"
-                                           f"已中断本轮。\n")
-                                    resp = self._active_resp
-                                    if resp is not None:
-                                        try:
-                                            await resp.cancel()
-                                        except Exception:
-                                            pass
-                                    break
-                                stripped = t.lstrip()
-                                if not (t.startswith("💭")
-                                        or stripped.startswith("🔧")
-                                        or stripped.startswith("↳")):
-                                    got_text = True
-                                yield t
-                        finally:
-                            # stop the model call + free locks on interrupt
+                        # Whole-turn safety: the stall watchdog below only catches a
+                        # SILENT stream (no chunk for _STALL_TIMEOUT). A turn that keeps
+                        # trickling chunks past _TURN_TIMEOUT must still be abandoned so
+                        # the egg never sits 运行中 forever — this arms the advertised
+                        # _TURN_TIMEOUT (which was previously dead code).
+                        async with asyncio.timeout(_TURN_TIMEOUT):
                             try:
-                                await chat.aclose()
-                            except Exception:  # pragma: no cover
-                                pass
+                                # Stream with a STALL watchdog: if no chunk arrives
+                                # for _STALL_TIMEOUT the model/server has gone quiet
+                                # (often a truncated/aborted upstream turn). Abort so
+                                # the egg leaves "运行中" and the panel/trace stop
+                                # looking frozen.
+                                agen = chat.__aiter__()
+                                while True:
+                                    try:
+                                        t = await asyncio.wait_for(
+                                            agen.__anext__(),
+                                            timeout=_STALL_TIMEOUT)
+                                    except StopAsyncIteration:
+                                        break
+                                    except asyncio.TimeoutError:
+                                        yield (f"\n⚠ 模型流静默超过 {_STALL_TIMEOUT:g}s，"
+                                               f"已中断本轮。\n")
+                                        resp = self._active_resp
+                                        if resp is not None:
+                                            try:
+                                                await resp.cancel()
+                                            except Exception:
+                                                pass
+                                        break
+                                    stripped = t.lstrip()
+                                    if not (t.startswith("💭")
+                                            or stripped.startswith("🔧")
+                                            or stripped.startswith("↳")):
+                                        got_text = True
+                                    yield t
+                            finally:
+                                # stop the model call + free locks on interrupt
+                                try:
+                                    await chat.aclose()
+                                except Exception:  # pragma: no cover
+                                    pass
                         if not got_text and not self._turn_payload:
                             # The turn produced NOTHING (no text, no tool call) —
                             # the response was truncated or rejected upstream.
@@ -793,7 +804,6 @@ class EggAgent:
         invisible to the user.
         """
         out = []
-        root = self.worktree.resolve()
         for p in self.worktree.rglob("*"):
             if not p.is_file():
                 continue

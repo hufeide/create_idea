@@ -380,9 +380,13 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
                 except Exception:  # pragma: no cover
                     pass
 
-        # Run in a child task so the stop button cancels only this compress,
-        # never the websocket connection.
-        await asyncio.create_task(do_compress())
+        # Fire-and-forget: run in a dedicated task so the websocket read-loop is
+        # NOT blocked while this egg compresses (the stop button's egg.interrupt
+        # cancels only this task, never the connection — compress sets
+        # self._task, so interrupt() reaches it).
+        task = asyncio.create_task(do_compress())
+        TASKS.add(task)
+        task.add_done_callback(TASKS.discard)
 
     elif t == "combine":
         new = await canvas.combine(msg.get("ids", []))

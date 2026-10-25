@@ -21,32 +21,15 @@ _REASON_TIMEOUT = float(os.environ.get("COMMANDER_REASON_TIMEOUT", "90"))
 _STALL_TIMEOUT = float(os.environ.get("COMMANDER_STALL_TIMEOUT", "120"))
 
 
-async def _aclose_quiet(cm):
-    """Close an SDK agent context manager in the background, swallowing errors."""
-    try:
-        await cm.__aexit__(None, None, None)
-    except Exception:
-        pass
-
 try:  # pragma: no cover
     from google.antigravity import Agent, types
     SDK_OK = True
 except Exception:  # pragma: no cover
     SDK_OK = False
 
-
-def _chunk_to_text(chunk):
-    if isinstance(chunk, str):
-        return chunk
-    if isinstance(chunk, types.Text):
-        return chunk.text
-    if isinstance(chunk, types.Thought):
-        return f"💭 {chunk.text}\n"
-    if isinstance(chunk, types.ToolCall):
-        return f"\n🔧 调用工具：{chunk.name}\n"
-    if isinstance(chunk, types.ToolResult):
-        return "   ↳ 工具结果已处理\n"
-    return ""
+# These two helpers are defined once in .egg and reused here to avoid drift
+# between the egg and the commander's stream rendering.
+from .egg import _chunk_to_text, _aclose_quiet
 
 
 class Commander:

@@ -442,26 +442,6 @@ class Canvas:
         self.eggs[eid] = egg
         return egg
 
-    async def _seed(self):
-        """Initial example so the canvas isn't empty on first load.
-
-        The goal is a top-level idea egg; the two modules are its sub-eggs, each
-        living in its own sub-directory under the goal's worktree.
-        """
-        goal = await self._spawn(
-            "目标", "天气查询机器人：用户输入城市，返回未来3天天气。", "idea", 80, 80
-        )
-        data = await self._spawn(
-            "数据获取蛋", "调用天气 API，按城市返回结构化天气数据。", "module",
-            480, 360, parent=goal.id,
-        )
-        view = await self._spawn(
-            "展示蛋", "将天气数据渲染为友好的卡片 UI。", "module", 880, 360,
-            parent=goal.id,
-        )
-        self.edges.append({"id": self._new_id("edge"), "from": goal.id, "to": data.id})
-        self.edges.append({"id": self._new_id("edge"), "from": goal.id, "to": view.id})
-
     # ---- goal -> eggs (LLM planner) ----
     async def generate(self, goal):
         # Each "generate idea" opens a NEW dated session so every idea project is
