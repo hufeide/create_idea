@@ -8,7 +8,6 @@ explicitly instead of faking a completion.
 """
 import asyncio
 import datetime
-import json
 import os
 import time
 import uuid
@@ -133,6 +132,12 @@ class EggAgent:
         self._start_error = None
         self._recorded_init = False
         self._si = ""
+        # Per-turn tracking so the trace can show REAL tool results when the
+        # backend provides them, and add a single honest note only when it cannot
+        # (the local openai backend executes tools server-side and returns no
+        # ToolResult chunk / does not fire the post_tool_call hook).
+        self._turn_tool_calls = 0
+        self._got_tool_result = False
         # Run state for the UI + interrupt: busy while a model turn streams, and
         # _task points at the task iterating run() so it can be cancelled.
         self.busy = False
@@ -191,6 +196,7 @@ class EggAgent:
 
         @sdk_hooks.post_tool_call
         def _tr(ctx: sdk_hooks.HookContext, data: types.ToolResult):
+            self._got_tool_result = True
             self._record("tool", "tool_result", name=getattr(data, "name", None),
                          result=getattr(data, "result", None),
                          error=getattr(data, "error", None))
@@ -222,6 +228,11 @@ class EggAgent:
             f"Either way, the deliverable is your final reply: state clearly what "
             f"you produced. If you wrote code, list the files and how to run them; "
             f"if you did not, present the content/result directly. "
+            f"Whenever you must hand over a written artifact, write it as a "
+            f"Markdown file in the ROOT of your workspace directory — that root "
+            f"is exactly what the user inspects with 「审阅代码」. Never put a "
+            f"deliverable inside agent_data/ (an internal folder the user "
+            f"cannot see). "
             f"Coordinates with connected eggs only when instructed. Be concise."
         )
         # Only keep the minimal SWE toolset (write/run code) — drop the default
@@ -426,9 +437,11 @@ class EggAgent:
             # A structured tool call IS a valid assistant payload (the API
             # accepts an assistant message that carries tool_calls).
             self._turn_payload = True
+            self._turn_tool_calls += 1
             self._record("assistant", "tool_call", name=chunk.name,
                          args=chunk.args)
         elif isinstance(chunk, types.ToolResult):
+            self._got_tool_result = True
             self._record("tool", "tool_result", name=chunk.name,
                          result=chunk.result, error=chunk.error)
 
@@ -474,6 +487,8 @@ class EggAgent:
                 "【以上为参考上下文。以下是用户给你的指令】\n"
                 f"{text}"
             )
+        self._turn_tool_calls = 0
+        self._got_tool_result = False
         resp = await self._agent.chat(text)
         self._active_resp = resp
         try:
@@ -482,6 +497,15 @@ class EggAgent:
                 t = _chunk_to_text(chunk)
                 if t:
                     yield t
+            # The local openai backend executes tools server-side and returns no
+            # ToolResult chunk (nor fires post_tool_call), so the client never
+            # sees the result. Say so ONCE per turn — but only when there really
+            # was a tool call AND no real result was recorded (cloud backends DO
+            # surface results via the hook, so they are never penalised here).
+            if self._turn_tool_calls > 0 and not self._got_tool_result:
+                self._record("tool", "tool_result",
+                             result="（本后端不回传工具结果：工具在服务端执行，"
+                                    "结果直接进入模型上下文；产物见本蛋工作目录）")
         finally:
             self._active_resp = None
 
@@ -731,49 +755,28 @@ class EggAgent:
 
     # ---- conversation history (used when combining eggs) ----
     def history_text(self, mode="brief", limit=None):
-        """Render this egg's chronological transcript into readable text.
+        """Render this egg's conversation for PASSING ON to another agent.
 
-        ``mode``:
-          - "brief" (default): only 用户+助手 text turns (commands & replies),
-            skipping thoughts / tool calls / tool results.
-          - "full": everything (thoughts 💭, tool calls, tool results, plans…).
+        ONLY the assistant's own answers are transmitted. The 💭 thinking, the
+        🔧 tool calls / ↳ results and the status entries stay in this egg's
+        local 轨迹 — they are process noise that must never enter another
+        egg's or the commander's context (it confuses the receiver and burns
+        its context window).
+
+        ``mode`` is kept for call-site compatibility; it no longer widens the
+        payload (there is no "thinking + tools" transfer any more).
         ``limit`` caps the output to its last N characters (keeps recent turns).
         """
         lines = []
         for r in self.transcript:
-            kind = r.get("kind")
-            role = r.get("role")
-            # skip pure infrastructure entries
-            if kind in ("system_prompt", "tools", "status"):
+            if r.get("kind") != "text":
                 continue
-            # brief mode keeps only user + assistant text turns
-            if mode != "full" and kind != "text":
+            if r.get("role") != "assistant":
                 continue
-            text = r.get("text")
-            name = r.get("name")
-            if kind == "prompt":
-                lines.append(f"[上下文] {text}")
-            elif kind == "plan":
-                lines.append(f"[计划] {text}")
-            elif kind == "thought":
-                lines.append(f"[思考] {text}")
-            elif kind == "tool_call":
-                try:
-                    args = json.dumps(r.get("args"), ensure_ascii=False)
-                except Exception:
-                    args = str(r.get("args"))
-                lines.append(f"[调用工具 {name}] {args}")
-            elif kind == "tool_result":
-                if r.get("error") is not None:
-                    lines.append(f"[工具结果 {name}] 错误: {r.get('error')}")
-                else:
-                    res = r.get("result")
-                    res = res if isinstance(res, str) else str(res)
-                    lines.append(f"[工具结果 {name}] {res}")
-            elif role == "user":
-                lines.append(f"用户: {text}")
-            elif role == "assistant":
-                lines.append(f"助手: {text}")
+            text = (r.get("text") or "").strip()
+            if not text:
+                continue
+            lines.append(f"助手: {text}")
         out = "\n".join(lines)
         if limit and len(out) > limit:
             out = "…（更早的历史略去）\n" + out[-limit:]
@@ -781,6 +784,14 @@ class EggAgent:
 
     # ---- worktree inspection (used by the "review code" panel) ----
     def list_files(self):
+        """Files the user can inspect in the 「审阅代码」 panel.
+
+        The worktree root is the review panel's root, so a deliverable written
+        here is directly visible/openable by the user. ``agent_data/`` holds the
+        SDK's internal app data (conversation db, logs) and is hidden — except
+        for markdown files, which may be deliverables and must never stay
+        invisible to the user.
+        """
         out = []
         root = self.worktree.resolve()
         for p in self.worktree.rglob("*"):
@@ -788,7 +799,8 @@ class EggAgent:
                 continue
             rel = p.relative_to(self.worktree)
             if rel.parts and rel.parts[0] in ("agent_data",):
-                continue
+                if p.suffix.lower() != ".md":
+                    continue
             out.append(str(rel))
         return sorted(out)
 

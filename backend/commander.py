@@ -57,7 +57,11 @@ class Commander:
         self._start_attempted = False
         self._start_error = None
         self._recorded_init = False
-        self._si = ""
+        # Populate the system prompt at construction time so the 轨迹 can record
+        # it even when the commander's persistent agent is never started (e.g. the
+        # debate / selected-targets path drives the eggs via a separate agent, so
+        # start() may never run — previously this left system_prompt empty).
+        self._si = self._system_prompt()
         # Session binding: when set, the commander's chat is persisted under the
         # session's save_dir and resumes via conversation_id across restarts.
         self.session_dir = session_dir
@@ -69,6 +73,58 @@ class Commander:
         self.conversation_id = conversation_id
         # Chronological coordinator trace — viewable via GET /api/trace/commander.
         self.transcript = []
+        # ---- run state for the UI + interrupt (mirrors EggAgent) ----
+        # busy while a commander run streams (the UI then shows a stop square),
+        # _tasks holds the in-flight run tasks so interrupt() can cancel them,
+        # and _active_resp is the SDK response of the running model turn so
+        # interrupt() can send the backend halt_request (not merely close the
+        # local reader).
+        self.busy = False
+        # What is currently running: 'chat' (a coordination turn) or 'run'
+        # (the commander driving the selected eggs).
+        self.run_kind = None
+        self._tasks = set()
+        self._active_resp = None
+
+    # ---- run state + interrupt (same strategy as an egg) ----
+    def begin_run(self, kind="chat", task=None):
+        """Mark a commander run as started (the UI shows the stop square)."""
+        self.busy = True
+        self.run_kind = kind
+        if task is not None:
+            self._tasks.add(task)
+
+    def end_run(self, task=None):
+        """Mark a commander run as finished (the UI restores the send button)."""
+        if task is not None:
+            self._tasks.discard(task)
+        self.busy = bool(self._tasks)
+        if not self.busy:
+            self.run_kind = None
+            self._active_resp = None
+
+    def interrupt(self):
+        """Stop the in-flight commander run (the stop button).
+
+        Same strategy as ``EggAgent.interrupt``: ask the backend to halt the
+        active model turn through the SDK's ``ChatResponse.cancel()`` (which
+        sends a ``halt_request``) AND cancel the local task that streams the
+        turn. Closing only the local reader would leave the server-side model
+        generating, so the stop button would not really stop the remote turn.
+        """
+        resp = self._active_resp
+        if resp is not None:
+            try:
+                # Fire-and-forget on the running loop: the halt_request is what
+                # really stops the backend turn; we don't need to await it.
+                asyncio.ensure_future(resp.cancel()).add_done_callback(
+                    lambda fut: fut.exception()  # swallow cancellation-side errors
+                )
+            except RuntimeError:
+                pass  # no running loop (e.g. during shutdown) — local cancel stands
+        for t in list(self._tasks):
+            if not t.done():
+                t.cancel()
 
     def bind_session(self, session_dir, conversation_id=None):
         """Attach this commander to a canvas session so its chat persists/resumes."""
@@ -90,10 +146,9 @@ class Commander:
         self._agent = None
         self._cm = None
 
-    async def start(self):
-        if not SDK_OK:
-            return
-        si = (
+    def _system_prompt(self):
+        """The commander's system prompt (kept in one place)."""
+        return (
             "你是总指挥（Commander），负责协调画布上的各个 idea 蛋（LLM 模块）。"
             "你通过接口 LLM 与各蛋沟通，提出修改与对齐建议。"
             "只有用户建立的连线才允许蛋之间互通消息。"
@@ -101,6 +156,11 @@ class Commander:
             "find_file）查看各蛋工作区里真实产出的文件，以便基于事实协调。"
             "请基于给定的画布状态给出协调方案，简明扼要。"
         )
+
+    async def start(self):
+        if not SDK_OK:
+            return
+        si = self._system_prompt()
         self._si = si
 
         async def _connect():
@@ -163,6 +223,21 @@ class Commander:
         self._cm = None
         self._agent = None
 
+    def _record_env(self):
+        """Record the commander's environment into its 轨迹 (once).
+
+        The 轨迹 must show the WHOLE conversation — the system prompt and the
+        enabled tools belong to it even when the commander never runs an LLM
+        turn itself (e.g. the debate workflow drives the eggs directly).
+        """
+        if self._recorded_init:
+            return
+        self._recorded_init = True
+        self._record("system", "system_prompt", text=self._si)
+        self._record("system", "tools",
+                     text="enabled: view_file / list_directory / "
+                          "search_directory / find_file（只读）")
+
     async def _ensure_started(self):
         if self._agent is not None:
             return True
@@ -170,12 +245,8 @@ class Commander:
             return False
         self._start_attempted = True
         await self.start()
-        if self._agent is not None and not self._recorded_init:
-            self._recorded_init = True
-            self._record("system", "system_prompt", text=self._si)
-            self._record("system", "tools",
-                         text="enabled: view_file / list_directory / "
-                              "search_directory / find_file（只读）")
+        if self._agent is not None:
+            self._record_env()
         return self._agent is not None
 
     async def _heal_conversation(self, err):
@@ -241,30 +312,38 @@ class Commander:
             self._record("assistant", "thought", text=text)
 
     def history_text(self, limit=None):
-        """Chronological user+assistant dialogue ONLY.
+        """The commander's own answers — the ONLY part that may be passed on.
 
         Tool calls, tool results, thinking and status entries are deliberately
         excluded — the commander/egg channels carry plain conversation context.
         """
         lines = []
         for r in self.transcript:
-            if r.get("role") not in ("user", "assistant"):
+            if r.get("role") != "assistant":
                 continue
             if r.get("kind") != "text":
                 continue
             text = (r.get("text") or "").strip()
             if not text:
                 continue
-            who = "用户" if r.get("role") == "user" else "总指挥"
-            lines.append(f"{who}：{text}")
+            lines.append(f"总指挥：{text}")
         out = "\n".join(lines)
         if limit and len(out) > limit:
             out = "…（更早的历史略去）\n" + out[-limit:]
         return out
 
-    async def run(self, text, graph_summary):
+    async def run(self, text, graph_summary, role="user"):
+        """Run one commander turn.
+
+        The USER turn itself is recorded by the caller (the canvas records it
+        before dispatching, so the 轨迹 shows it even when the commander never
+        runs an LLM turn). Here we only record the assembled prompt; ``role``
+        tells whether this turn is the user's instruction or a system-driven
+        recap (a recap is NOT a user message).
+        """
         prompt = f"{graph_summary}\n\n用户协调指令：{text}\n请给出协调/修改建议。"
-        self._record("user", "text", text=text)
+        if role != "user":
+            self._record(role, "text", text=text)
         self._record("system", "prompt", text=prompt)
         if not SDK_OK:
             self._record("system", "status",
@@ -299,6 +378,9 @@ class Commander:
                             yield f"\n⚠ 思考超时（{_REASON_TIMEOUT:g}s），已停止。\n"
                             return
                     resp = await self._agent.chat(prompt)
+                    # Remember the active response so interrupt() can send the
+                    # backend a halt_request (same as the eggs do).
+                    self._active_resp = resp
                     payload = False
                     # Iterate resp.chunks (NOT `async for chunk in resp`): the
                     # latter filters to Text only and would DROP Thought,
@@ -342,6 +424,7 @@ class Commander:
                         t = _chunk_to_text(chunk)
                         if t:
                             yield t
+                    self._active_resp = None
                     if not payload:
                         # Empty turn -> it will be persisted as an empty assistant
                         # message and poison the next request. Drop the
@@ -352,8 +435,10 @@ class Commander:
                             "'content' or 'tool_calls'!")
                     return
                 except asyncio.CancelledError:
+                    self._active_resp = None
                     raise
                 except Exception as ex:
+                    self._active_resp = None
                     if attempt == 1 and await self._heal_conversation(ex):
                         continue
                     self._record("system", "status",

@@ -31,7 +31,27 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def index():
-    return FileResponse(FRONTEND)
+    # no-store: a reload must ALWAYS pick up the current frontend. Without it
+    # the browser may serve a cached copy of index.html, so a freshly deployed
+    # UI change appears to do nothing.
+    return FileResponse(FRONTEND,
+                        headers={"Cache-Control": "no-store, no-cache, max-age=0"})
+
+
+@app.get("/api/version")
+async def app_version():
+    """Build stamp of the served frontend.
+
+    The page polls it and reloads itself when the stamp changes, so a tab that
+    was opened BEFORE a frontend edit picks the new code up on its own instead
+    of silently keeping the old behaviour.
+    """
+    try:
+        st = FRONTEND.stat()
+        build = f"{int(st.st_mtime)}-{st.st_size}"
+    except Exception:
+        build = "0"
+    return {"build": build}
 
 
 @app.get("/api/egg/{egg_id}/files")
@@ -68,6 +88,7 @@ async def trace_commander():
     canvas: Canvas = app.state.canvas
     return {
         "connected": canvas.commander._agent is not None,
+        "busy": canvas.commander.busy,
         "transcript": getattr(canvas.commander, "transcript", []),
     }
 
@@ -93,8 +114,14 @@ async def interrupt_egg(egg_id: str = Query(...)):
 
     Uses HTTP (not the WS channel) because the WS read-loop is busy streaming
     while an egg runs, so an interrupt must arrive on a separate request.
+
+    ``egg_id='commander'`` interrupts the 总指挥 itself: its model turn is
+    halted and the task streaming it is cancelled.
     """
     canvas: Canvas = app.state.canvas
+    if egg_id == "commander":
+        canvas.interrupt_commander()
+        return {"ok": True, "eggId": egg_id, "busy": canvas.commander.busy}
     egg = canvas.eggs.get(egg_id)
     if not egg:
         raise HTTPException(404)
@@ -108,8 +135,8 @@ async def list_sessions():
     return {"sessions": Canvas.list_sessions()}
 
 
-async def _stream_events(ws: WebSocket, agen):
-    """Translate orchestration events into WS messages.
+async def _send_event(ws: WebSocket, ev: dict):
+    """Translate ONE orchestration event into a WS message.
 
     Shared by the commander (advice/control) and the one-click run:
       say      -> stream into the commander chat (schedule / narration)
@@ -118,28 +145,97 @@ async def _stream_events(ws: WebSocket, agen):
       end_egg  -> finalize that egg's stream
       end      -> finalize the commander stream
     """
-    async for ev in agen:
-        k = ev.get("k")
-        if k == "say":
-            await ws.send_json({"type": "token", "eggId": "commander", "text": ev["text"]})
-        elif k == "say_break":
-            # Start a NEW commander message (the previous one is finalized).
-            await ws.send_json({"type": "sayBreak", "eggId": "commander"})
-        elif k == "instruct":
-            await ws.send_json({"type": "msg", "eggId": ev["egg"], "role": "user",
-                                "text": ev["text"]})
-        elif k == "egg":
-            await ws.send_json({"type": "token", "eggId": ev["egg"], "text": ev["text"]})
-        elif k == "plan":
-            await ws.send_json({"type": "plan", "steps": ev["steps"],
-                                "round": ev.get("round", 0)})
-        elif k == "status":
-            await ws.send_json({"type": "status", "eggId": ev["egg"],
-                                "status": ev["status"]})
-        elif k == "end_egg":
-            await ws.send_json({"type": "done", "eggId": ev["egg"]})
-        elif k == "end":
-            await ws.send_json({"type": "done", "eggId": "commander"})
+    k = ev.get("k")
+    if k == "say":
+        # role="system" = a process note (stage header / error / failure summary):
+        # it belongs in the 轨迹, NOT in the chat panel, which shows the
+        # commander's own words only.
+        await ws.send_json({"type": "token", "eggId": "commander",
+                            "text": ev["text"], "role": ev.get("role", "assistant")})
+    elif k == "say_break":
+        # Start a NEW commander message (the previous one is finalized).
+        await ws.send_json({"type": "sayBreak", "eggId": "commander"})
+    elif k == "instruct":
+        await ws.send_json({"type": "msg", "eggId": ev["egg"], "role": "user",
+                            "text": ev["text"]})
+    elif k == "egg":
+        await ws.send_json({"type": "token", "eggId": ev["egg"], "text": ev["text"]})
+    elif k == "plan":
+        await ws.send_json({"type": "plan", "steps": ev["steps"],
+                            "round": ev.get("round", 0)})
+    elif k == "status":
+        await ws.send_json({"type": "status", "eggId": ev["egg"],
+                            "status": ev["status"]})
+    elif k == "end_egg":
+        await ws.send_json({"type": "done", "eggId": ev["egg"]})
+    elif k == "end":
+        # The commander panel is idle again -> its button is restored.
+        await ws.send_json({"type": "status", "eggId": "commander", "status": "idle"})
+        await ws.send_json({"type": "done", "eggId": "commander"})
+
+
+def _run_commander_panel(ws: WebSocket, canvas: Canvas, kind: str,
+                         agen_factory):
+    """Run a 总指挥 run in a DEDICATED task and stream it to the client.
+
+    The run (a coordination turn or the one-click run of the selected eggs) is
+    executed in its own task — exactly like an egg's command — so the
+    websocket read-loop stays free and the stop button can interrupt the run
+    without killing the connection.
+
+    ``kind`` is 'chat' or 'run'; it tells ``interrupt_commander()`` whether the
+    eggs started by this run must be stopped as well.
+    """
+    gen = None
+
+    async def produce():
+        nonlocal gen
+        task = asyncio.current_task()
+        canvas.commander.begin_run(kind, task)
+        try:
+            await ws.send_json({"type": "status", "eggId": "commander",
+                                "status": "running"})
+            gen = agen_factory()
+            async for ev in gen:
+                await _send_event(ws, ev)
+        except asyncio.CancelledError:
+            # Interrupted by the stop button: tell the user, then let the
+            # cancellation propagate so the workflow's finally blocks clean up.
+            try:
+                await ws.send_json({"type": "system", "eggId": "commander",
+                                    "text": "⏹ 已打断总指挥运行。"})
+            except Exception:  # pragma: no cover
+                pass
+            raise
+        except Exception as ex:
+            try:
+                await ws.send_json({"type": "error",
+                                    "message": f"总指挥运行失败：{ex}"})
+            except Exception:  # pragma: no cover
+                pass
+        finally:
+            if gen is not None:
+                try:
+                    await gen.aclose()
+                except BaseException:  # pragma: no cover
+                    pass
+            # The run is over -> the UI restores the send button.
+            canvas.commander.end_run(task)
+            try:
+                canvas.save()
+            except Exception:  # pragma: no cover
+                pass
+            try:
+                await ws.send_json({"type": "status", "eggId": "commander",
+                                    "status": "idle"})
+                await ws.send_json({"type": "done", "eggId": "commander"})
+            except Exception:  # pragma: no cover
+                pass
+
+    task = asyncio.create_task(produce())
+    TASKS.add(task)
+    task.add_done_callback(TASKS.discard)
+    return task
 
 
 async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
@@ -210,7 +306,11 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
         task.add_done_callback(TASKS.discard)
 
     elif t == "interrupt":
-        egg = canvas.eggs.get(msg.get("eggId"))
+        eid = msg.get("eggId")
+        if eid == "commander":
+            canvas.interrupt_commander()
+            return
+        egg = canvas.eggs.get(eid)
         if egg:
             egg.interrupt()
 
@@ -312,24 +412,28 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
         targets = msg.get("targets") or (
             [msg.get("target")] if msg.get("target") else []
         )
-        await _stream_events(ws, canvas.commander_run(msg.get("text", ""), targets))
-        try:
-            canvas.save()
-        except Exception:
-            pass
+        text = msg.get("text", "")
+        # Run in a dedicated task so the stop button can interrupt the run
+        # (and the websocket read-loop stays free) — same as an egg's command.
+        _run_commander_panel(
+            ws, canvas, "chat",
+            lambda: canvas.commander_run(text, targets),
+        )
 
     elif t == "run":
-        await _stream_events(ws, canvas.run_selected(msg.get("targets") or []))
-        try:
-            canvas.save()   # persist any recovered conversation ids, etc.
-        except Exception:
-            pass
+        targets = msg.get("targets") or []
+        # Same as above: the one-click run is interruptible from the 总指挥
+        # panel (its button turns into a stop square while it runs).
+        _run_commander_panel(
+            ws, canvas, "run",
+            lambda: canvas.run_selected(targets),
+        )
 
     elif t == "setHistoryMode":
-        mode = msg.get("mode")
-        if mode in ("brief", "full"):
-            canvas.history_mode = mode
-            await ws.send_json({"type": "historyMode", "mode": canvas.history_mode})
+        # 传递会话消息时永远只传 assistant 的正文：思考(💭)与工具调用(🔧)只留在
+        # 本地轨迹，不再有任何"全部历史（含思考/工具）"的传递模式。
+        canvas.history_mode = "brief"
+        await ws.send_json({"type": "historyMode", "mode": canvas.history_mode})
 
     elif t == "setReasoning":
         from .egg import set_reasoning_capture
