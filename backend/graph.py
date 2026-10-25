@@ -67,6 +67,39 @@ _ABORT_MARKERS = (
 )
 
 
+def _looks_like_tool_call(text):
+    """True when the 'answer' is just a tool call that leaked into plain text.
+
+    Some models occasionally emit {"name": "...", "arguments": {...}} —
+    optionally wrapped in <tool_call> tags — as ASSISTANT TEXT instead of
+    actually executing the tool. Nothing was done and nothing was concluded:
+    this is process noise, never the egg's 复命, and must not count as a
+    conclusion.
+    """
+    s = re.sub(r"</?tool_call>", "", str(text or "")).strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return False
+    return '"name"' in s and '"arguments"' in s
+
+
+def _named_md_paths(text):
+    """Yield relative .md paths named in free text.
+
+    A fragment of an ABSOLUTE path (e.g. the "AbsolutePath" value inside a
+    leaked tool call) is never a named deliverable: within the same
+    whitespace-delimited token, a "/" before the match start means we are
+    mid-path, so the candidate is skipped.
+    """
+    for m in re.finditer(r"(?<![\w.\\-])((?:[^\s`'\"/\\]+/)*[^\s`'\"/\\]+\.md)",
+                         str(text or "")):
+        start = m.start(1)
+        tok = max(str(text or "").rfind(ch, 0, start)
+                  for ch in (" ", "\t", "\r", "\n", "　")) + 1
+        if "/" in str(text or "")[tok:start]:
+            continue
+        yield m.group(1)
+
+
 async def _pump(agen, q):
     """Drain an async generator into a queue on its OWN task.
 
@@ -115,7 +148,7 @@ class CommanderTask(pydantic.BaseModel):
     notify: list[str] = pydantic.Field(default_factory=list)
     # Eggs whose CONCLUSION this task depends on. A task that depends on
     # another task OF THE SAME ROUND cannot start yet — the commander defers
-    # it to the next round (e.g. a judge that must weigh both debaters).
+    # it to the next round (e.g. a downstream egg that must wait for others).
     depends_on: list[str] = pydantic.Field(default_factory=list)
 
 
@@ -655,612 +688,7 @@ class Canvas:
             e.x, e.y = x, y
         self.autosave()
 
-    # ---- deterministic multi-round debate workflow ----
-    def _debate_role_for_egg(self, eid):
-        """Classify a debate participant from its title, never from its prompt body."""
-        egg = self.eggs.get(eid)
-        if not egg:
-            return None
-        title = str(getattr(egg, "title", "") or "").strip().lower()
-        if re.search(r"(总结陈词|总结总结|总结汇报|收尾总结|最终总结|finalizer|closing statement)", title):
-            return "finalizer"
-        if re.search(r"(裁判|评委|评判|裁决|仲裁|judge|referee|adjudicat)", title):
-            return "judge"
-        if re.search(r"(自由辩论主持|辩论主持|主持人|主持|moderator|host)", title):
-            return "host"
-        if re.search(r"(正方|支持方|正方辩手|\bpro\b|affirmative)", title):
-            return "pro"
-        if re.search(r"(反方|反对方|反方辩手|\bcon\b|negative)", title):
-            return "con"
-        return None
-
-    def _requested_debate_rounds(self, text):
-        """Return an explicitly requested debate-round count, or None.
-
-        A round count may be stated literally ("运行一轮辩论", "打3轮"), or implied
-        by an explicit start/run verb aimed at a debate ("开始一场辩论", "来辩论",
-        "debate 开始") — that is treated as a 1-round execution request so the
-        workflow actually runs instead of the commander only giving advice.
-        Design/discussion verbs (设计/讨论/规划/准备…) deliberately do NOT count.
-        """
-        instruction = str(text or "")
-        if not re.search(r"(辩论|debate)", instruction, re.I):
-            return None
-        match = re.search(r"(\d+|一|二|两|三|四)\s*轮", instruction)
-        if match:
-            raw = match.group(1)
-            mapping = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4}
-            try:
-                rounds = int(raw) if raw.isdigit() else mapping.get(raw, 0)
-            except (TypeError, ValueError):
-                return None
-            return rounds if 1 <= rounds <= 4 else None
-        # No literal "X轮" — accept a clear start/run verb as an implicit 1 round.
-        if re.search(
-            r"(开始|启动|开启|进行|开展|运行|执行|来|跑|搞|弄|组织|举办|发起|直接|马上|开)\s*"
-            r"(一\s*)?(场|次|个|轮|局|回合|下)?\s*(辩论|debate)"
-            r"|(辩论|debate)\s*(开始|启动|开启|进行|开展|运行|执行|来|搞|发起|开)",
-            instruction, re.I):
-            return 1
-        return None
-
-    def _is_explicit_debate_execution_request(self, text):
-        """Distinguish an execution command from a request to discuss/design a debate."""
-        instruction = str(text or "").strip()
-        if self._requested_debate_rounds(instruction) is None:
-            return False
-        # Some frontends display/send the mode label as a prefix, e.g. "全局协调建议：".
-        # Remove only that known UI label so it cannot accidentally suppress the command.
-        command_text = re.sub(
-            r"^\s*(?:\*\*)?[（(【]?(?:全局协调建议|协调建议|全局协调)[）)】]?(?:\*\*)?\s*[:：\\\n]*",
-            "", instruction, count=1)
-        # Leading advice/planning formulations should not start agents. Do not reject a
-        # genuine command merely because the UI mode label contains the word "建议".
-        if re.search(r"^\s*(?:我?建议|如何|怎么|设计|规划|分析|解释|为什么|不要|别\s*开始|先别|不执行)", command_text):
-            return False
-        return bool(re.search(
-            r"(开始|启动|开展|组织|进行|主持|来一场|打一场|start|run|conduct|organize).{0,24}(辩论|debate)"
-            r"|(辩论|debate).{0,16}(开始|启动|开展|组织|进行|start|run|conduct)",
-            command_text, re.I))
-
-    def _edge_connected_components(self):
-        """Return weakly connected components based only on actual canvas edges."""
-        adjacency = {eid: set() for eid in self.eggs}
-        for edge in self.edges:
-            src, dst = edge.get("from"), edge.get("to")
-            if src in adjacency and dst in adjacency and src != dst:
-                adjacency[src].add(dst)
-                adjacency[dst].add(src)
-        components = []
-        unseen = set(adjacency)
-        # Preserve canvas insertion order within components for stable UI ordering.
-        order = {eid: i for i, eid in enumerate(self.eggs)}
-        while unseen:
-            first = min(unseen, key=lambda eid: order[eid])
-            stack, found = [first], set()
-            while stack:
-                current = stack.pop()
-                if current in found:
-                    continue
-                found.add(current)
-                stack.extend(adjacency[current] - found)
-            unseen.difference_update(found)
-            components.append(sorted(found, key=lambda eid: order[eid]))
-        return components
-
-    def _resolve_connected_debate_targets(self, scope_ids=None):
-        """Resolve one unambiguous debate group from connected canvas nodes.
-
-        If a project/root or only some participants were passed as targets, restrict the
-        search to connected components intersecting those ids. Structural/project eggs
-        may connect participant eggs, but only role-labelled participants are dispatched.
-        Disconnected role groups are never silently combined.
-        """
-        scope_ids = set(scope_ids or [])
-        qualified = []
-        for component in self._edge_connected_components():
-            if scope_ids and not (scope_ids & set(component)):
-                continue
-            roles = {key: [] for key in ("pro", "con", "host", "judge", "finalizer")}
-            for eid in component:
-                role = self._debate_role_for_egg(eid)
-                if role:
-                    roles[role].append(eid)
-            if len(roles["pro"]) == 1 and len(roles["con"]) == 1 and (
-                    roles["host"] or roles["judge"] or roles["finalizer"]):
-                participants = [eid for eid in component if self._debate_role_for_egg(eid)]
-                qualified.append((participants, roles))
-
-        if len(qualified) == 1:
-            return qualified[0][0], ""
-        if not qualified:
-            return [], (
-                "没有在同一个连线连通组中找到唯一的一名正方、一名反方，"
-                "以及至少一名主持人、裁判或总结节点。请确认这些蛋已在画布中连线，"
-                "并且标题能明确识别角色。"
-            )
-        return [], (
-            f"当前画布有 {len(qualified)} 组符合条件的辩论参与者，无法判断应运行哪一组。"
-            "请选中目标辩论组后再下达指令。"
-        )
-
-    def _detect_debate_workflow(self, text, targets):
-        """Recognize explicit round-count debate requests with role-labelled targets."""
-        rounds = self._requested_debate_rounds(text)
-        if rounds is None:
-            return None
-        roles = {key: [] for key in ("pro", "con", "host", "judge", "finalizer")}
-        for eid in targets:
-            role = self._debate_role_for_egg(eid)
-            if not role:
-                return None
-            roles[role].append(eid)
-        # Exactly one pro and one con are required. Do not silently choose among
-        # multiple debaters; that would make stage completion ambiguous.
-        if len(roles["pro"]) != 1 or len(roles["con"]) != 1:
-            return None
-        if any(len(roles[k]) > 1 for k in ("host", "judge", "finalizer")):
-            return None
-        if not (roles["host"] or roles["judge"] or roles["finalizer"]):
-            return None
-        return {"rounds": rounds, **roles}
-
-    async def _run_debate_workflow(self, text, targets, workflow):
-        """Run: opening statements -> N rebuttal rounds -> adjudication/closing.
-
-        The controller, not the LLM planner, owns phase transitions. Results are stored
-        by task_id and phase and are not overwritten when the same egg speaks again.
-        Notifications are injected into a real task's context, but never generate tasks
-        by themselves.
-        """
-        summary = self._commander_context(targets, mode="brief")
-        boxes, channels, cmd_hist = {}, {}, [{"role": "user", "text": text}]
-        inbox = self._pending_notifications
-        notified, all_results = [], []
-        running, bg = {}, []
-        events = asyncio.Queue()
-        stage_results = []
-        phase_outputs = {}
-        run_key = f"debate-{time.time_ns()}"
-        workflow_record = {
-            "run_id": run_key,
-            "workflow": "debate",
-            "instruction": str(text),
-            "targets": list(targets),
-            "roles": {key: list(workflow.get(key) or []) for key in
-                      ("pro", "con", "host", "judge", "finalizer")},
-            "rounds": int(workflow["rounds"]),
-            "status": "running",
-            "current_phase": "starting",
-            "completed_phases": [],
-            "failure": "",
-            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        }
-        self._workflow_runs[run_key] = workflow_record
-        self.autosave(force=True)
-        normal_exit = False
-        final_summary = ""
-        phase_index = 0
-        failed_phase = None
-        # Eggs that were still talking to the LLM when the workflow ended.
-        stopped_eggs = []
-        stop_note = ""
-
-        pro_id = workflow["pro"][0]
-        con_id = workflow["con"][0]
-        host_id = workflow["host"][0] if workflow["host"] else None
-        judge_id = workflow["judge"][0] if workflow["judge"] else None
-        finalizer_id = workflow["finalizer"][0] if workflow["finalizer"] else None
-        total_rounds = workflow["rounds"]
-
-        def context_text():
-            parts = [f"【用户原始指令】\n{text}",
-                     "【当前工作流约束】\n本工作流由调度器按阶段控制；不得宣布其他阶段已完成，不得跳过尚未执行的阶段。"]
-            for item in stage_results:
-                parts.append(
-                    f"【已完成阶段：{item['phase']}｜{item['title']}｜task_id={item['task_id']}】\n"
-                    f"{item['result'][:5000]}"
-                )
-            joined = "\n\n".join(parts)
-            # Keep a bounded context while retaining the most recent exchange.
-            # The bound must stay well below the model's context window: the
-            # egg's own instructions + tool schemas already cost ~5.5k tokens,
-            # and an oversized prompt made the run fail with
-            # "the most recent step could not fit in the available context limit".
-            if len(joined) > 7000:
-                joined = joined[:2500] + "\n\n【较早阶段内容省略】\n\n" + joined[-4500:]
-            return joined
-
-        async def execute_phase(phase_key, phase_label, task_specs):
-            """Yield UI events while running one barrier-synchronized stage."""
-            nonlocal phase_index, failed_phase
-            phase_index += 1
-            # Every phase's eggs should be able to read the OTHER participants'
-            # deliverable directories (the worktree roots the user sees in
-            # 「审阅代码」). Use the full coordinated set (`targets`), not just
-            # this batch, so a single-egg phase (e.g. the judge) still receives
-            # all peer directories.
-            all_peers = list(targets)
-            workflow_record["current_phase"] = phase_key
-            workflow_record["status"] = "running"
-            workflow_record["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-            self.autosave(force=True)
-            self.commander._record("system", "phase", text=f"【阶段 {phase_index}：{phase_label}】")
-            yield {"k": "say_break"}
-            yield {"k": "say", "text": f"【辩论阶段 {phase_index}：{phase_label}】正在执行；本阶段完成前不会进入下一阶段。", "role": "system"}
-
-            # Freeze context at the stage boundary. A retry in this same stage must not
-            # accidentally read another participant's newly generated same-stage reply.
-            phase_context = context_text()
-            pending = [(dict(spec), 0) for spec in task_specs]
-            phase_successes = {}
-            phase_failures = []
-            while pending:
-                batch = []
-                attempts_by_id = {}
-                for original, attempt in pending:
-                    eid = original["egg_id"]
-                    task_id = f"{run_key}:{phase_key}:{eid}:attempt{attempt + 1}"
-                    step = {
-                        "egg_id": eid,
-                        "title": self.eggs[eid].title,
-                        "message": original["message"] + (
-                            "\n\n【受控重试】上一次输出未成功保存。请重新完成本阶段任务，只输出本阶段交付物。"
-                            if attempt else ""),
-                        "deliver": [], "notify": [], "depends_on": [],
-                        "phase": phase_key, "task_id": task_id,
-                        "goal_context": original.get("goal_context") or phase_context,
-                        "_debate_attempt": attempt,
-                    }
-                    batch.append(step)
-                    attempts_by_id[eid] = (original, attempt)
-
-                plan_steps = [{
-                    "egg_id": st["egg_id"], "title": st["title"],
-                    "message": st["message"], "deliver": [], "notify": [],
-                    "depends_on": [], "mode": "runnable", "phase": phase_key,
-                    "task_id": st["task_id"],
-                } for st in batch]
-                yield {"k": "plan", "round": phase_index, "steps": plan_steps}
-                for st in plan_steps:
-                    yield {"k": "status", "egg": st["egg_id"], "status": "planned"}
-
-                started_ids = []
-                # Preflight the entire barrier before starting anyone. This avoids
-                # a partial phase where e2 begins but e4 is already busy, leaving
-                # an externally visible half-round before the phase is rejected.
-                unavailable = []
-                for st in batch:
-                    eid = st["egg_id"]
-                    egg = self.eggs.get(eid)
-                    if (egg is None or eid in running or
-                            bool(getattr(egg, "busy", False))):
-                        unavailable.append(eid)
-                if unavailable:
-                    started = 0
-                else:
-                    started = self._start_runs(
-                        batch, boxes, channels, inbox, events, running, bg,
-                        started_ids=started_ids, goal_context=None,
-                        extra_peers=all_peers,
-                    )
-                if started != len(batch):
-                    # A phase is a barrier: partial dispatch must fail the whole
-                    # phase instead of retrying just the tasks that never started.
-                    missing_steps = [st for st in batch if st["egg_id"] not in started_ids]
-                    reasons = [
-                        f"{st['title']} 无法启动（节点不存在、已在其他运行中，或启动失败）"
-                        for st in missing_steps
-                    ]
-                    failure_note = (
-                        f"阶段「{phase_label}」未能完整启动；已启动的同阶段任务会被取消，"
-                        "未启动任务不会单独重试，以免破坏阶段一致性。"
-                        + ("原因：" + "；".join(reasons) if reasons else "")
-                    )
-                    cancel_tasks = []
-                    started_records = []
-                    for eid in started_ids:
-                        rec = running.pop(eid, None)
-                        if rec is None:
-                            continue
-                        started_records.append(rec)
-                        for key in ("pump", "consumer"):
-                            task = rec.get(key)
-                            if task is not None and not task.done():
-                                task.cancel()
-                                cancel_tasks.append(task)
-                    if cancel_tasks:
-                        await asyncio.gather(*cancel_tasks, return_exceptions=True)
-                    now = datetime.datetime.now().isoformat(timespec="seconds")
-                    # Persist a failed task record for every requested member of
-                    # the stage, including members that never started.
-                    for st in batch:
-                        task_id = str(st.get("task_id") or f"{run_key}:{phase_key}:{st['egg_id']}")
-                        self._task_results[task_id] = {
-                            "task_id": task_id,
-                            "egg_id": st["egg_id"],
-                            "title": st["title"],
-                            "phase": phase_key,
-                            "message": str(st.get("message") or ""),
-                            "status": "failed",
-                            "result": failure_note,
-                            "updated_at": now,
-                        }
-                    for rec in started_records:
-                        rec["failed"] = True
-                        rec["cancelled"] = True
-                        rec["done"] = True
-                        rec["error"] = failure_note
-                    failed_phase = phase_label
-                    workflow_record["status"] = "failed"
-                    workflow_record["failure"] = failure_note
-                    workflow_record["updated_at"] = now
-                    self.autosave(force=True)
-                    for st in plan_steps:
-                        yield {"k": "status", "egg": st["egg_id"], "status": "idle"}
-                        yield {"k": "end_egg", "egg": st["egg_id"]}
-                    yield {"k": "say", "text": failure_note, "role": "system"}
-                    return
-                active = set(started_ids)
-                retry_pending = []
-                while active:
-                    while not events.empty():
-                        yield events.get_nowait()
-                    finished_ids = [eid for eid in active
-                                    if eid in running and running[eid].get("done")]
-                    if not finished_ids:
-                        event = await self._next_event(events, _MONITOR_INTERVAL)
-                        if event is not None:
-                            yield event
-                        continue
-                    for eid in finished_ids:
-                        rec = running.pop(eid)
-                        active.discard(eid)
-                        # A stage counts as finished ONLY when the egg really
-                        # concluded something. A turn that produced nothing but
-                        # 💭 thinking / 🔧 tool chatter, or that was cut off
-                        # (stall watchdog / upstream error), is a FAILURE — it
-                        # must not be reported as "阶段完成" while the egg is
-                        # still talking to the LLM.
-                        has_output = self._run_has_output(rec)
-                        if (not (rec.get("reply") or "").strip()
-                                or not has_output
-                                or self._run_was_cut_off(rec)):
-                            rec["failed"] = True
-                            rec["error"] = rec.get("error") or (
-                                "本轮没有产出结论（只有思考/工具过程）"
-                                if not has_output else
-                                "本轮被中断，未产出完整结论")
-                        self._file_result(rec, boxes, channels, cmd_hist, inbox,
-                                          notified, all_results)
-                        yield {"k": "status", "egg": eid, "status": "idle"}
-                        yield {"k": "end_egg", "egg": eid}
-                        original, attempt = attempts_by_id[eid]
-                        reply = rec.get("reply") or ""
-                        if rec.get("failed"):
-                            if attempt < 1:
-                                retry_pending.append((original, attempt + 1))
-                            else:
-                                reason = rec.get("error") or "空输出"
-                                phase_failures.append(
-                                    f"{self.eggs[eid].title} 在重试后仍未成功"
-                                    f"（{reason}）：{reply[:300]}")
-                        else:
-                            # Only the assistant's own answer may travel to the
-                            # next stage / be embedded into another egg's prompt
-                            # (e.g. the host's "本轮问题结果" handed to pro/con).
-                            # The raw `reply` still carries 💭 thinking and 🔧 tool
-                            # chatter, which would pollute the receiver's context.
-                            phase_successes[eid] = self._assistant_only(self.eggs[eid], rec)
-                            stage_results.append({
-                                "task_id": rec["step"].get("task_id"),
-                                "egg_id": eid,
-                                "title": self.eggs[eid].title,
-                                "phase": phase_key,
-                                # Only the assistant's own text travels to the
-                                # next stage — never the 💭 thinking / 🔧 tools.
-                                "result": self._assistant_only(self.eggs[eid], rec),
-                            })
-                            self.autosave(force=True)
-                pending = retry_pending
-                if phase_failures:
-                    failed_phase = phase_label
-                    workflow_record["status"] = "failed"
-                    workflow_record["failure"] = "; ".join(phase_failures)
-                    workflow_record["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-                    self.autosave(force=True)
-                    return
-            # Do not move to a next stage until every member of this stage succeeded.
-            phase_outputs[phase_key] = dict(phase_successes)
-            workflow_record["completed_phases"].append(phase_key)
-            workflow_record["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-            self.autosave(force=True)
-
-        try:
-            role_intro = (
-                f"正方：{self.eggs[pro_id].title}（{pro_id}）；反方：{self.eggs[con_id].title}（{con_id}）。"
-                f"本次要求 {total_rounds} 轮交锋，另含开篇立论和最终裁判/总结。"
-            )
-            self.commander._record("assistant", "text", text=role_intro)
-            yield {"k": "say_break"}
-            yield {"k": "say", "text": "已识别为分阶段辩论任务。" + role_intro, "role": "system"}
-
-            # Stage 1: opening statements in parallel.
-            opening = []
-            for eid, side in ((pro_id, "正方"), (con_id, "反方")):
-                opening.append({
-                    "egg_id": eid,
-                    "message": (
-                        f"【阶段：开篇立论】你是本场{side}。围绕辩题「{text}」明确立场，\n"
-                        "给出核心论点、至少三个分论点及其推理链，并预判对方最有力的反驳。\n"
-                        "只完成立论，不代替对方回答，不做最终裁决。对于统计数据或研究结论，"
-                        "没有可靠来源时不要编造具体数字。"
-                    ),
-                })
-            async for event in execute_phase("opening", "双方开篇立论", opening):
-                yield event
-            if failed_phase:
-                final_summary = f"辩论未完成：阶段「{failed_phase}」失败，后续阶段没有启动。请检查对应子蛋输出后重试。"
-
-            # Rounds: optional host poses focused prompts, then both sides answer in parallel.
-            if not failed_phase:
-                for round_no in range(1, total_rounds + 1):
-                    if host_id:
-                        host_task = [{
-                            "egg_id": host_id,
-                            "message": (
-                                f"【主持阶段：第 {round_no} 轮交锋问题】基于此前双方实际输出，设计本轮 1-2 个尖锐、"
-                                "对双方公平且能引出实质论证的问题。明确标出问题分别要求正方和反方回应的内容。"
-                                "只提出本轮问题和规则，不替双方作答、不裁决。"
-                            ),
-                        }]
-                        async for event in execute_phase(f"round{round_no}_host", f"主持人设计第 {round_no} 轮问题", host_task):
-                            yield event
-                        if failed_phase:
-                            break
-                    exchanges = []
-                    for eid, side, opponent in ((pro_id, "正方", "反方"), (con_id, "反方", "正方")):
-                        moderator_suffix = (
-                            f"必须直接回答主持人本轮问题。主持人本轮问题结果：{phase_outputs.get(f'round{round_no}_host', {}).get(host_id, '')[:2000]}"
-                            if host_id else "本轮没有单独主持人，请直接针对对方上一阶段论点提出回应和追问。"
-                        )
-                        exchanges.append({
-                            "egg_id": eid,
-                            "message": (
-                                f"【第 {round_no} 轮交锋】你是{side}。请基于已提供的前序阶段记录，逐点回应{opponent}最近的论证，"
-                                "先准确概括对方观点，再给出反驳、依据和反问；承认对方确有说服力的部分并说明边界。"
-                                "不要仅重复初始立论，也不要声称未在记录中出现的内容。\n" + moderator_suffix
-                            ),
-                        })
-                    async for event in execute_phase(f"round{round_no}_exchange", f"第 {round_no} 轮正反交锋", exchanges):
-                        yield event
-                    if failed_phase:
-                        break
-
-            # Final assessment: judge first, finalizer after it if separate.
-            if not failed_phase and judge_id:
-                async for event in execute_phase("adjudication", "裁判综合评判", [{
-                    "egg_id": judge_id,
-                    "message": (
-                        f"【最终裁判】评判辩题「{text}」。必须综合开篇立论和全部 {total_rounds} 轮真实交锋记录，"
-                        "比较双方论点的一致性、回应有效性、证据质量和逻辑漏洞；区分事实与价值判断，"
-                        "指出双方各自最强论证与仍未解决的问题，并给出有理由的裁决或说明为何难分胜负。"
-                        "不得把尚未发生的交锋当作事实，也不要编造数据或引用。"
-                    ),
-                }]):
-                    yield event
-                if not failed_phase:
-                    finalizer_id = finalizer_id if finalizer_id and finalizer_id != judge_id else None
-
-            if not failed_phase and finalizer_id:
-                async for event in execute_phase("closing", "最终总结陈词", [{
-                    "egg_id": finalizer_id,
-                    "message": (
-                        f"【最终总结】根据本场辩题「{text}」的开篇立论、全部 {total_rounds} 轮交锋，"
-                        "以及已有裁判意见（如有），分别总结正方、反方最有力的论证，归纳分歧核心与共同点，"
-                        "给出中立观众点评。请明确区分已发生的交锋与仍可继续讨论的问题。"
-                    ),
-                }]):
-                    yield event
-
-            if not failed_phase:
-                # If a host is the only available controller, ask it to close neutrally.
-                if not judge_id and not finalizer_id and host_id:
-                    async for event in execute_phase("host_closing", "主持人中立收束", [{
-                        "egg_id": host_id,
-                        "message": (
-                            f"【最终收束】根据开篇立论和全部 {total_rounds} 轮交锋，给出中立总结："
-                            "双方最强论点、关键分歧和未决问题。不要偏袒任何一方。"
-                        ),
-                    }]):
-                        yield event
-                final_summary = (
-                    f"{total_rounds} 轮辩论工作流已完成：双方开篇立论、{total_rounds} 轮交锋"
-                    + ("、裁判评判" if judge_id else "")
-                    + ("、最终总结" if finalizer_id else "")
-                    + "均已按阶段执行并保存任务级结果。"
-                )
-                # "已完成" may only be claimed when every participant really
-                # produced a conclusion. A node whose turn was cut off (or that
-                # only produced thinking) is NOT done — say so instead.
-                missing = []
-                for eid in (pro_id, con_id, host_id, judge_id, finalizer_id):
-                    if not eid or eid not in self.eggs:
-                        continue
-                    if not any(item.get("egg_id") == eid for item in stage_results):
-                        missing.append(self.eggs[eid].title)
-                if missing:
-                    failed_phase = "结论缺失"
-                    final_summary = (
-                        "辩论未完整完成："
-                        + "、".join(missing)
-                        + " 没有产出可用结论（运行被中断或只产生了思考过程），"
-                        "相关阶段不会被报告为成功。请查看这些节点的轨迹后重试。"
-                    )
-            workflow_record["status"] = "failed" if failed_phase else "completed"
-            if failed_phase:
-                workflow_record["failure"] = workflow_record.get("failure") or final_summary
-            else:
-                workflow_record["failure"] = ""
-            workflow_record["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-            self.autosave(force=True)
-            normal_exit = True
-            self.commander._record("assistant", "text", text=final_summary)
-            yield {"k": "say_break"}
-            yield {"k": "say", "text": final_summary}
-        finally:
-            # ALWAYS stop whatever is still running. A workflow that "ends" while
-            # an egg is still talking to the LLM leaves the model generating on the
-            # server (tokens keep burning) and the egg stuck in 运行中. The eggs
-            # are interrupted with the SDK's halt_request, so the SERVER-side turn
-            # really stops — not just the local reader.
-            # NOTE: no `yield` in here: this block also runs while the generator
-            # is being closed (GeneratorExit), where yielding is illegal.
-            for eid, rec in list(running.items()):
-                for key in ("pump", "consumer"):
-                    task = rec.get(key)
-                    if task is not None and not task.done():
-                        task.cancel()
-                rec["failed"] = True
-                rec["cancelled"] = True
-                rec["done"] = True
-                if eid not in stopped_eggs:
-                    stopped_eggs.append(eid)
-            for task in list(bg):
-                if not task.done():
-                    task.cancel()
-            for eid in stopped_eggs:
-                egg = self.eggs.get(eid)
-                if egg is None:
-                    continue
-                try:
-                    egg.interrupt()
-                except Exception:  # pragma: no cover - defensive
-                    pass
-            if bg:
-                await asyncio.gather(*bg, return_exceptions=True)
-            if stopped_eggs:
-                names = "、".join(self.eggs[e].title for e in stopped_eggs
-                                  if e in self.eggs)
-                stop_note = (f"⚠ 工作流结束时仍有节点在运行，已中止：{names}。"
-                             "这些节点没有产出可用结论，请查看其轨迹后重试。")
-                self.commander._record("system", "status", text=stop_note)
-                workflow_record["stopped"] = stopped_eggs
-                if workflow_record.get("status") == "completed":
-                    workflow_record["status"] = "failed"
-                    workflow_record["failure"] = stop_note
-            if not normal_exit:
-                workflow_record["status"] = "interrupted"
-                workflow_record["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-            self.autosave(force=True)
-        if stopped_eggs:
-            for eid in stopped_eggs:
-                yield {"k": "status", "egg": eid, "status": "idle"}
-                yield {"k": "end_egg", "egg": eid}
-            yield {"k": "say", "text": stop_note, "role": "system"}
-        yield {"k": "end"}
-
+    # ---- commander-driven general workflow ----
     # ---- commander ----
     def interrupt_commander(self):
         """Stop the in-flight 总指挥 run (the stop button).
@@ -1278,83 +706,22 @@ class Canvas:
                     egg.interrupt()
 
     async def commander_run(self, text, targets=None):
-        """Run explicit debate commands from selected targets or one connected debate group."""
+        """Drive the selected eggs through the general Commander loop.
+
+    The Commander (LLM) decides the task type, assigns each selected role an
+    appropriate prompt, and arranges the procedure (parallel for independent
+    tasks, serialized via depends_on for dependent phases). There is no
+    hard-coded workflow -- debate, research, design, review, etc. are all
+    expressed the same general way.
+        """
         targets = list(dict.fromkeys(t for t in (targets or []) if t in self.eggs))
-        explicit_debate = self._is_explicit_debate_execution_request(text)
+
 
         # 轨迹完整性：用户的指令与总指挥的运行环境（system prompt + 工具）必须
-        # 出现在总指挥的轨迹里，即使这一轮并不走 commander.run()（例如分阶段
-        # 辩论由调度器直接驱动子蛋）。
+        # 出现在总指挥的轨迹里。
         self.commander._record_env()
         self.commander._record("user", "text", text=text)
 
-        # Important: the UI's "全局协调建议" entry often supplies no selected IDs.
-        # Before falling back to plain Commander chat, resolve an explicit command such
-        # as "开始一轮辩论" against one unambiguous, edge-connected debate group.
-        if explicit_debate:
-            original_targets = list(targets)
-            debate = self._detect_debate_workflow(text, targets) if targets else None
-            if debate is None:
-                # This also handles a frontend that passes the project root, or only
-                # some selected participants, instead of an empty target list.
-                resolved, reason = self._resolve_connected_debate_targets(scope_ids=targets)
-                if not resolved:
-                    message = "识别到明确的辩论执行请求，但没有启动任何子蛋。" + reason
-                    self.commander._record("assistant", "text", text=message)
-                    yield {"k": "say", "text": message, "role": "system"}
-                    yield {"k": "end"}
-                    return
-                targets = resolved
-                debate = self._detect_debate_workflow(text, targets)
-                if debate is None:
-                    message = (
-                        "找到了连线范围内的辩论节点，但角色配置仍不唯一。"
-                        "请检查正方、反方、主持人/裁判/总结的节点标题，且每种角色只能有一个候选。"
-                    )
-                    yield {"k": "say", "text": message, "role": "system"}
-                    yield {"k": "end"}
-                    return
-                titles = "、".join(f"{self.eggs[eid].title}（{eid}）" for eid in targets)
-                scope_note = "全局画布" if not original_targets else "所选节点所在的连线组"
-                yield {"k": "say", "text": f"已从{scope_note}自动识别辩论参与者：{titles}。正在启动分阶段辩论。", "role": "system"}
-
-        debate = self._detect_debate_workflow(text, targets) if explicit_debate else None
-        if debate is not None:
-            try:
-                async for event in self._run_debate_workflow(text, targets, debate):
-                    yield event
-            except asyncio.CancelledError:
-                # Client disconnect / caller cancellation must propagate so the
-                # workflow's finally block can mark the run interrupted and clean up.
-                raise
-            except Exception as ex:
-                message = f"辩论工作流异常终止：{type(ex).__name__}: {ex}。后续阶段已停止，请检查日志后重试。"
-                # _run_debate_workflow normally marks interruption in its finally;
-                # this wrapper upgrades the latest unfinished run to a visible failure.
-                for record in reversed(list(self._workflow_runs.values())):
-                    if record.get("workflow") == "debate" and record.get("status") in {"running", "interrupted"}:
-                        record["status"] = "failed"
-                        record["failure"] = message
-                        record["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-                        break
-                self.autosave(force=True)
-                self.commander._record("assistant", "text", text=message)
-                yield {"k": "say_break"}
-                yield {"k": "say", "text": message, "role": "system"}
-                # The workflow generator's trailing end event is skipped when it
-                # raises; emit the terminal UI event here for the error path.
-                yield {"k": "end"}
-            return
-        if explicit_debate:
-            message = (
-                "识别到辩论执行请求，但无法建立唯一的阶段工作流。请确保目标中恰有一名正方、一名反方，"
-                "并且至少有一名主持人、裁判或总结节点；同一角色不能有多个候选。"
-                "如果使用全局协调，请将参与者放在同一个连线组中。"
-            )
-            self.commander._record("assistant", "text", text=message)
-            yield {"k": "say", "text": message, "role": "system"}
-            yield {"k": "end"}
-            return
 
         summary = self._commander_context(targets)
         if not targets:
@@ -1544,13 +911,31 @@ class Canvas:
                                 # a producer task with depends_on=[] during finish recovery.
                                 cycle_nodes = self._find_dependency_cycle(postponed)
                                 if cycle_nodes:
-                                    final_summary = (
-                                        "任务未能完整完成：待办任务存在显式依赖循环："
-                                        + " -> ".join(cycle_nodes)
-                                        + "。请修正 depends_on 后重新运行；未完成任务不会被报告为成功。"
-                                    )
-                                    normal_exit = True
-                                    break
+                                    # A cycle (e.g. mutual debate roles) has no
+                                    # runnable root. Break it and keep dispatching
+                                    # instead of deadlocking and reporting failure.
+                                    self._break_dependency_cycles(postponed)
+                                    now_ready = [task_copy(p) for p in postponed
+                                                 if dependencies_ready(p)]
+                                    if now_ready:
+                                        tasks = now_ready
+                                        action = "dispatch"
+                                        decision["note"] = (
+                                            (decision.get("note") or "")
+                                            + f"；检测到显式 depends_on 循环（"
+                                            + " -> ".join(cycle_nodes)
+                                            + "），已临时断开循环依赖以继续调度。")
+                                        cmd_hist.append({"role": "user", "text":
+                                                         "【调度保护】依赖循环已断开，"
+                                                         "继续派发待办任务。"})
+                                    else:
+                                        final_summary = (
+                                            "任务未能完整完成：待办任务存在显式依赖循环："
+                                            + " -> ".join(cycle_nodes)
+                                            + "。请修正 depends_on 后重新运行；未完成任务不会被报告为成功。"
+                                        )
+                                        normal_exit = True
+                                        break
                                 missing_deps = []
                                 for pending in unsatisfied:
                                     for dep in (pending.get("depends_on") or []):
@@ -1578,7 +963,7 @@ class Canvas:
                                 must_run_targets = list(dict.fromkeys(missing_targets))
                                 # Dispatch missing explicit producers first. If there are no
                                 # such producers, recover one target at a time in selection
-                                # order; never guess that a host/finalizer is ready in parallel.
+                                # order; never guess that a dependent task is ready in parallel.
                                 if not forced and must_run_targets:
                                     missing_target = must_run_targets[0]
                                     egg = self.eggs[missing_target]
@@ -1659,6 +1044,21 @@ class Canvas:
                     if tasks:
                         self._resolve_dependencies(tasks, boxes, eligible_ids=targets)
                         task_ids = {t["egg_id"] for t in tasks}
+                        # Structural guard (general): if a task is authorized to read
+                        # (deliver) another egg dispatched in THIS same decision, it
+                        # needs that egg's fresh output this round. Auto-add it to
+                        # depends_on so the scheduler defers the consumer until the
+                        # producer finishes, instead of racing it in parallel. Existing
+                        # conclusions (already in boxes) are not auto-waited.
+                        for t in tasks:
+                            _deliver_ids = set(t.get("deliver") or [])
+                            _extra = [d for d in _deliver_ids
+                                      if d in task_ids and d != t["egg_id"]
+                                      and d not in boxes]
+                            if _extra:
+                                _cur = set(t.get("depends_on") or [])
+                                _cur.update(_extra)
+                                t["depends_on"] = sorted(_cur)
                         producers = {}
                         for task in list(tasks):
                             for dep in task.get("depends_on") or []:
@@ -1683,6 +1083,18 @@ class Canvas:
                     # never silently dropped by _start_runs.
                     busy_tasks = [t for t in tasks if t["egg_id"] in running]
                     tasks = [t for t in tasks if t["egg_id"] not in running]
+                    # Idempotency guard: a task for an egg that already has a successful
+                    # conclusion this round (in boxes) and is not running is redundant
+                    # -- do not re-run it. This stops the commander from re-dispatching
+                    # finished eggs (the "重复派活" chaos) while pending work proceeds.
+                    completed_idle = {t["egg_id"] for t in tasks
+                                      if t["egg_id"] in boxes and t["egg_id"] not in running}
+                    if completed_idle:
+                        tasks = [t for t in tasks if t["egg_id"] not in completed_idle]
+                        _skip_names = ", ".join(self.eggs[e].title
+                                                for e in completed_idle if e in self.eggs)
+                        decision["note"] = ((decision.get("note") or "")
+                                            + f"；已跳过本轮已完成、无需重复派活的蛋：{_skip_names}")
                     runnable, deferred = self._split_by_dependency(
                         tasks, boxes, eligible_ids=targets, running_ids=set(running)
                     )
@@ -1700,45 +1112,70 @@ class Canvas:
                     postponed = list(pending_map.values())
 
                     # If every task is deferred and no producer is running, the remaining
-                    # in-round dependency graph has no runnable root (normally a real cycle).
-                    # Never execute an arbitrary task to conceal a cycle.
+                    # in-round dependency graph has no runnable root. A cycle of explicit
+                    # depends_on edges is the common cause — break it so the workflow can
+                    # make progress instead of deadlocking forever (we only drop the edges
+                    # that close a cycle; acyclic dependencies stay intact).
                     if (tasks or postponed) and not runnable and not running:
                         pending_for_check = list({
                             p.get("egg_id"): p for p in (postponed + tasks)
                             if p.get("egg_id")
                         }.values())
                         cycle_nodes = self._find_dependency_cycle(pending_for_check)
-                        invalid_refs = [
-                            (p.get("egg_id"), err)
-                            for p in pending_for_check
-                            for err in (p.get("_dependency_errors") or [])
-                        ]
-                        unselected_deps = [
-                            (p.get("egg_id"), dep)
-                            for p in pending_for_check
-                            for dep in (p.get("depends_on") or [])
-                            if dep in self.eggs and dep not in target_set
-                            and dep not in boxes and dep not in running
-                        ]
-                        waiting = "、".join(
-                            f"{p.get('title', p.get('egg_id'))}({p.get('_pending_reason', '依赖未满足')})"
-                            for p in pending_for_check
-                        )
                         if cycle_nodes:
-                            reason = "检测到显式 depends_on 循环：" + " -> ".join(cycle_nodes)
-                        elif invalid_refs:
-                            reason = f"存在无法解析的依赖引用：{invalid_refs}。请修正依赖中的节点 ID/唯一标题。"
-                        elif unselected_deps:
-                            reason = f"依赖指向本次未选中的节点：{unselected_deps}。请一并选择上游节点后重试。"
+                            # Drop only the cycle-closing edges and retry the schedule.
+                            self._break_dependency_cycles(tasks)
+                            self._break_dependency_cycles(postponed)
+                            decision["note"] = (
+                                (decision.get("note") or "")
+                                + f"；检测到显式 depends_on 循环（{' -> '.join(cycle_nodes)}），"
+                                  "已临时断开循环依赖以继续调度，非循环依赖的先后关系保持不变。"
+                            )
+                            runnable, deferred = self._split_by_dependency(
+                                tasks, boxes, eligible_ids=targets,
+                                running_ids=set(running))
+                            pending_map = {p.get("egg_id"): task_copy(p)
+                                           for p in postponed
+                                           if p.get("egg_id") in target_set}
+                            for task in busy_tasks:
+                                upsert_pending(pending_map, task,
+                                               "当前蛋仍在运行；新指令排队等待本次运行结束")
+                            for task in deferred:
+                                upsert_pending(pending_map, task,
+                                               task.get("_pending_reason") or "等待依赖结果")
+                            for task in runnable:
+                                pending_map.pop(task["egg_id"], None)
+                            postponed = list(pending_map.values())
                         else:
-                            reason = "依赖尚未满足，且当前没有可运行的上游任务。请检查显式 depends_on。"
-                        final_summary = (
-                            "无法继续调度：" + reason
-                            + (f" 待办：{waiting}。" if waiting else "")
-                            + "系统已停止自动调度，未将未完成任务报告为成功。"
-                        )
-                        normal_exit = True
-                        break
+                            invalid_refs = [
+                                (p.get("egg_id"), err)
+                                for p in pending_for_check
+                                for err in (p.get("_dependency_errors") or [])
+                            ]
+                            unselected_deps = [
+                                (p.get("egg_id"), dep)
+                                for p in pending_for_check
+                                for dep in (p.get("depends_on") or [])
+                                if dep in self.eggs and dep not in target_set
+                                and dep not in boxes and dep not in running
+                            ]
+                            waiting = "、".join(
+                                f"{p.get('title', p.get('egg_id'))}({p.get('_pending_reason', '依赖未满足')})"
+                                for p in pending_for_check
+                            )
+                            if invalid_refs:
+                                reason = f"存在无法解析的依赖引用：{invalid_refs}。请修正依赖中的节点 ID/唯一标题。"
+                            elif unselected_deps:
+                                reason = f"依赖指向本次未选中的节点：{unselected_deps}。请一并选择上游节点后重试。"
+                            else:
+                                reason = "依赖尚未满足，且当前没有可运行的上游任务。请检查显式 depends_on。"
+                            final_summary = (
+                                "无法继续调度：" + reason
+                                + (f" 待办：{waiting}。" if waiting else "")
+                                + "系统已停止自动调度，未将未完成任务报告为成功。"
+                            )
+                            normal_exit = True
+                            break
 
                     plan_steps = []
                     mode = "并行" if len(runnable) > 1 else ("串行" if runnable else "等待")
@@ -1882,6 +1319,7 @@ class Canvas:
                 async for token in self.commander.run(recap_prompt, summary, role="system"):
                     yield {"k": "say", "text": token}
         except Exception as ex:  # pragma: no cover
+            self.commander._record("system", "status", text=f"（总结失败：{ex}）")
             yield {"k": "say", "text": f"（总结失败：{ex}）", "role": "system"}
         yield {"k": "end"}
 
@@ -1935,6 +1373,8 @@ class Canvas:
                 "elapsed": round(elapsed, 1),
                 "stuck": bool(running and silent > _EGG_SILENT),
                 "overdue": bool(running and elapsed > _EGG_OVERDUE),
+                "no_delivery": bool(running and elapsed > _EGG_OVERDUE
+                                  and not (self._last_delivery.get(t) or {}).get("delivered")),
                 "pending": len(inbox.get(t) or []),
                 "completed": bool(e.last_completion),
                 "delivered": ((self._last_delivery.get(t) or {}).get("delivered")),
@@ -1952,17 +1392,30 @@ class Canvas:
         for eid, st in watch.items():
             if not st["running"]:
                 continue
-            kind = "overdue" if st["overdue"] else ("stuck" if st["stuck"] else None)
+            # Priority: a long-running egg that has NEVER delivered is the
+            # most urgent signal -- it is neither progressing visibly nor
+            # producing a deliverable. Surface it before the milder
+            # silence / runtime warnings.
+            kind = ("no_delivery" if st["no_delivery"]
+                    else "overdue" if st["overdue"]
+                    else "stuck" if st["stuck"] else None)
             if not kind:
                 continue
             key = (eid, kind)
             if key in reported:
                 continue
             reported.add(key)
-            what = "运行超时" if kind == "overdue" else "长时间没有新输出"
+            if kind == "no_delivery":
+                what = "【长期运行未交付】长期运行却始终未交付（既无新增输出也无交付物）"
+            elif kind == "overdue":
+                what = "运行超时"
+            else:
+                what = "长时间没有新输出"
             msg = (f"【监控告警】蛋「{st['title']}」{what}"
                    f"（已运行 {st['elapsed']}s，静默 {st['silent']}s，"
-                   f"会话长度 {st['len']} 字）。")
+                   f"会话长度 {st['len']} 字）。"
+                   f"请判断它是仍在努力推进还是已卡住，并采取行动："
+                   f"重新明确交付标准、改写指令、换蛋或中止。")
             cmd_hist.append({"role": "user", "text": msg})
             alerts.append(msg)
         return alerts
@@ -1975,8 +1428,9 @@ class Canvas:
         for eid, st in watch.items():
             if st["running"]:
                 growth = f"+{st['delta']}字" if st["delta"] > 0 else "无新增"
+                mark = "【长期运行未交付】" if st["no_delivery"] else ""
                 parts.append(f"{eid} 运行中(会话{st['len']}字，"
-                             f"本轮{growth}，静默{st['silent']}s)")
+                             f"本轮{growth}，静默{st['silent']}s){mark}")
             else:
                 pend = f"，待处理通知{st['pending']}条" if st["pending"] else ""
                 mark = ""
@@ -2007,13 +1461,15 @@ class Canvas:
                 extra += f"，静默 {st['silent']}s"
             if st["pending"]:
                 extra += f"，有 {st['pending']} 条待你处理的完成通知"
-            if st["overdue"]:
+            if st["no_delivery"]:
+                extra += "，【长期运行未交付】"
+            elif st["overdue"]:
                 extra += "，【运行超时】"
             elif st["stuck"]:
                 extra += "，【长时间无输出】"
             if st.get("delivered") is True:
                 extra += f"，【已交付】{st.get('delivery') or ''}"
-            elif st.get("delivered") is False:
+            elif st.get("delivered") is False and not st["no_delivery"]:
                 extra += f"，【未交付】{st.get('delivery') or ''}"
             lines.append(f"- id={eid} 「{st['title']}」{state} | 会话长度 "
                          f"{st['len']} 字，{growth}{extra}")
@@ -2165,6 +1621,32 @@ class Canvas:
                 visit(node)
         return sorted(cycle)
 
+    def _break_dependency_cycles(self, tasks):
+        """Drop ONLY the edges that close an explicit depends_on cycle.
+
+        A cycle (e.g. a debate's roles each depending on the others) has no
+        runnable root, so the scheduler would otherwise deadlock forever. We
+        remove the intra-cycle ``depends_on`` entries — a self- or mutual
+        dependency that can never be satisfied — while keeping every acyclic
+        dependency intact, then re-check until the graph is acyclic. Returns
+        True if any edge was removed.
+        """
+        broke = False
+        for _ in range(len(tasks) + 1):
+            cycle = self._find_dependency_cycle(tasks)
+            if not cycle:
+                break
+            cycle_set = set(cycle)
+            for task in tasks:
+                deps = list(task.get("depends_on") or [])
+                if not deps:
+                    continue
+                new_deps = [d for d in deps if d not in cycle_set]
+                if len(new_deps) != len(deps):
+                    task["depends_on"] = sorted(set(new_deps))
+                    broke = True
+        return broke
+
     def _resolve_dependencies(self, tasks, boxes=None, eligible_ids=None):
         """Normalize ONLY explicitly declared dependencies; never infer graph edges.
 
@@ -2226,6 +1708,15 @@ class Canvas:
             egg = self.eggs.get(eid)
             if not egg or eid in running or bool(getattr(egg, "busy", False)):
                 continue
+            # A new run invalidates the previous delivery record: the egg is now
+            # working on a fresh task, so "delivered" must reflect THIS run only.
+            # While running, an absent/False delivery makes the watch panel surface
+            # the 【长期运行未交付】 alert if the egg runs past the overdue
+            # threshold without producing a deliverable (rather than trusting a
+            # stale "已交付" from a prior completed run).
+            self._last_delivery[eid] = {"delivered": False,
+                                        "detail": "本轮运行中，尚未交付",
+                                        "path": None, "bytes": 0, "chars": 0}
             # Keep runtime-only acknowledgement metadata off the UI plan object.
             run_step = dict(step)
             run_step["goal_context"] = run_step.get("goal_context") or goal_context or ""
@@ -2238,7 +1729,7 @@ class Canvas:
                     and not self._has_named_deliverable(message)):
                 message = message + self._delivery_standard(egg, message)
             # Coordination context: tell this egg where its peers' deliverables
-            # live so it can read them. The judge/finalizer especially need to
+            # live so it can read them. A downstream or aggregating egg especially needs to
             # consult the other participants' actual output (not just their own
             # workspace), which is impossible without knowing the peer directories.
             peer_ids = scheduled_ids | set(extra_peers or ())
@@ -2247,6 +1738,11 @@ class Canvas:
                 if block:
                     message = message + block
             run_step["message"] = message
+            # 轨迹完整性：实际下达的完整指令（含补加的交付标准/同伴目录）必须留在
+            # 总指挥自己的轨迹里——否则“总指挥→子蛋”方向的交互在轨迹中缺失。
+            # kind="instruct" 使其只进轨迹，不参与聊天面板回填（chatRole 只认 text）。
+            self.commander._record("assistant", "instruct",
+                                   text=f"🎯 派发指令给「{egg.title}」：\n{message}")
             events.put_nowait({"k": "instruct", "egg": eid,
                                "text": "🎯 总指挥指令：" + message})
             events.put_nowait({"k": "status", "egg": eid, "status": "running"})
@@ -2287,7 +1783,7 @@ class Canvas:
                 rec["tokens"].append(item)
                 await events.put({"k": "egg", "egg": eid, "text": item})
         except asyncio.CancelledError:
-            # Cancellation must also be a terminal state. The debate phase loop
+            # Cancellation must also be a terminal state. This phase loop
             # waits for rec["done"], so leaving it False here can deadlock forever.
             rec["failed"] = True
             rec["cancelled"] = True
@@ -2342,7 +1838,22 @@ class Canvas:
                                          rec.get("started_at"))
         rec["delivery"] = delivery
         self._last_delivery[eid] = delivery
-        if not failed:
+        # 完成的两条硬标准，缺一不可：交付物真的落盘 + 给总指挥有效复命
+        # （最终回复非空且不是泄漏的工具调用）。缺任何一条都不计为完成——
+        # 不进结论盒子、不满足 depends_on，等总指挥重新派活/受控重试。
+        delivered = bool(delivery.get("delivered"))
+        reported = bool(reply.strip()) and not _looks_like_tool_call(reply)
+        complete = (not failed) and delivered and reported
+        if not failed and not complete:
+            reasons = []
+            if not delivered:
+                reasons.append("交付物未落盘")
+            if not reported:
+                reasons.append("没有有效复命（最终回复为空或只是泄漏的工具调用）")
+            failed = True
+            rec["failed"] = True
+            rec["error"] = rec.get("error") or ("未计为完成：" + "、".join(reasons))
+        if complete:
             boxes[eid] = {"result": reply}
             # A successful run acknowledges only the inbox prefix it actually saw.
             consumed = list(step.get("_consumed_inbox") or [])
@@ -2362,7 +1873,7 @@ class Canvas:
                 inbox[eid] = current
             else:
                 inbox.pop(eid, None)
-        status_text = "执行失败" if failed else "完成"
+        status_text = "完成" if complete else "执行失败"
         task_id = str(step.get("task_id") or f"run-{time.time_ns()}-{eid}")
         self._task_results[task_id] = {
             "task_id": task_id,
@@ -2370,10 +1881,10 @@ class Canvas:
             "title": egg.title,
             "phase": str(step.get("phase") or "commander"),
             "message": str(step.get("message") or ""),
-            "status": "failed" if failed else "completed",
+            "status": "completed" if complete else "failed",
             "result": reply,
             "error": str(rec.get("error") or ""),
-            "delivered": bool(delivery.get("delivered")),
+            "delivered": delivered,
             "deliverable": delivery.get("path"),
             "delivery_detail": delivery.get("detail"),
             "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -2395,19 +1906,23 @@ class Canvas:
             pch.append({"role": "assistant",
                         "text": f"当前任务执行{status_text}：\n{reply}"})
 
-        cmd_hist.append({
-            "role": "user",
-            "text": (f"【子蛋「{egg.title}」{status_text}】\n"
-                     f"结论/错误：{reply[:2000]}\n"
-                     f"交付核验：{delivery.get('detail')}"
-                     + ("" if delivery.get("delivered")
-                        else " —— 该结论尚未落盘，若它是本轮必需的成果，"
-                             "请重新派活并明确要求写盘交付。")),
-        })
+        report_text = (
+            f"【子蛋「{egg.title}」{status_text}】\n"
+            f"结论/错误：{reply[:2000]}\n"
+            f"交付核验：{delivery.get('detail')}"
+            + ("" if complete
+               else " —— 不计为完成："
+                    + (rec.get("error") or "执行失败")
+                    + "。该结论不会进入结论盒子、不满足 depends_on；"
+                      "请重新派活，明确要求写盘交付并在最终回复里复命。"))
+        cmd_hist.append({"role": "user", "text": report_text})
+        # 子蛋→总指挥的复命也必须留在总指挥的轨迹里（对总指挥而言是 user 方向的
+        # 来文）。kind="report" 使其只进轨迹，不参与聊天面板回填。
+        self.commander._record("user", "report", text=report_text)
         notified.append({"egg": eid, "title": egg.title, "reply": reply[:2000],
                          "failed": failed,
                          "delivery": delivery.get("detail"),
-                         "delivered": bool(delivery.get("delivered"))})
+                         "delivered": delivered})
 
         # Notifications persist across commander_run calls and session restarts.
         for target in (step.get("notify") or []):
@@ -2493,33 +2008,48 @@ class Canvas:
                 "2) 每轮先读【子蛋实时监控】：\n"
                 "   · 会话长度/增量：增量>0 说明该蛋还在推进；增量=0 且静默很久说明它"
                 "卡住了 —— 你可以重新给它派活、换一只蛋接手，或直接收尾。\n"
+                "   · 【判定子蛋是“仍在运行”还是“已卡住”的明确标准】（系统也据此发告警）：\n"
+                "     - 运行中且【仍有新增输出 + 静默 < 180s】→ 视为正常推进，不必干预；\n"
+                "     - 运行中但【静默 > 180s 无任何新增输出】→ 标记【长时间无输出】，视为卡住；\n"
+                "     - 运行中且【已运行 > 420s】→ 标记【运行超时】；\n"
+                "     - 运行中且【已运行 > 420s 却始终没有任何交付物】→ 标记【长期运行未交付】，"
+                "这是最紧急的信号：它既没新增输出也没产出交付物，几乎肯定卡住或偏离方向。\n"
+                "   · 对【监控告警】必须行动，不能忽视：\n"
+                "     - 【长期运行未交付】：先重新给它一份明确、可核验的【交付标准 + 交付路径】，"
+                "改写简短清晰的指令；若仍无起色，换一只蛋接手，或中止该蛋并改派他人；\n"
+                "     - 【运行超时 / 长时间无输出】：重新派活、换蛋接手，或收尾。\n"
                 "   · 【待处理的完成通知】：子蛋跑完后会主动通知你（你总会收到）。\n"
-                "   · 【监控告警】：运行超时/长时间无输出的蛋需要你裁决。\n"
-                "3) 一次只给本轮的指令。若本轮这些蛋互不依赖，可同时给多个（并行）；"
-                "若需要等某个结果才能定下一步，就只给一个（串行）。\n"
+                "   · 【交付物审核】子蛋自称“已交付”时，你【不能凭它一句话】就计为完成："
+                "先核对监控面板里的【已交付】记录（系统已核验文件是否落盘且非空），"
+                "必要时用只读工具 view_file 抽查其交付文件是否真的达到你下达的【交付标准】；"
+                "达不到标准的，重新派活并写明差距，不得计为完成。\n"
+                "3) 一次只给本轮的指令。若本轮有多个互不依赖的任务，必须在【同一次 decision】里全部列出，系统会并行启动它们；\n"
+                "不要把互不依赖的任务分到多轮逐个派发（那会变成串行）。若某个任务必须等另一任务的结果才能继续，才只给一个（串行）并写 depends_on。\n"
+                "3g) 【任务类型与角色完全由你决定，不要套固定模板】本系统没有预设任何角色或流程。每次先判断本次任务的【类型】（调研、方案设计、辩论、代码实现、审阅、头脑风暴、翻译、写作等，但不限于这些），再据此为每个被选中的蛋（角色）拟定【贴合其职责与任务类型】的具体提示词（写在 message 里）。角色由画布上的蛋标题体现，你按任务需要赋予它们不同的职责与协作方式——同一组蛋在不同任务里该做什么由你决定。多阶段任务用 depends_on 串起顺序；互不依赖的任务必须在同一次 decision 里全部列出，系统会并行启动。\n"
                 "3c) 如果【上一轮被推迟的任务】里还有蛋在等待，说明还有活没干完"
-                "（例如裁判还没裁决）——必须先派活给它，不能直接 finish。\n"
+                "（例如某个汇总/裁决节点还没产出）——必须先派活给它，不能直接 finish。\n"
                 "3a) 同一只蛋在一轮里只给一个任务；已经产出结论的蛋，除非指令明确要求"
                 "它继续推进，否则不要重复派它。\n"
                 "3b) 【时序/依赖】凡是必须等待另一个蛋本轮产出后才能执行的任务，必须在"
                 "depends_on 中填写来源蛋的真实 id。系统只把 depends_on 当作明确的等待关系；"
-                "不要因为指令里提到了正方/反方、使用了‘回应’或‘复核’就推断等待关系。"
-                "例如辩论：正方与反方立论互不依赖，同轮并行；主持人依赖双方时写"
-                "depends_on=[\"e2\", \"e4\"]；总结陈词还应等待主持人交锋结束。"
+                "不要因为指令里提到了某个阶段、或使用了‘回应’‘复核’‘汇总’等词就自动推断等待关系。"
+                "例如：A 与 B 的初稿互不依赖，可同轮并行；C 需要综合 A、B 时写"
+                "depends_on=[\"e2\", \"e4\"]；最终汇总 D 还应等待 C 完成。"
                 "不要依赖基于角色名称、节点标题、画布连线或自然语言动词的自动推断；"
-                "调度器只执行你显式写入 depends_on 的等待关系。对先立论、再主持交锋、"
-                "最后总结的多阶段任务，你必须自己写清依赖：主持人 depends_on 包含双方立论 id，"
-                "最终总结 depends_on 包含主持人 id。\n"
+                "调度器只执行你显式写入 depends_on 的等待关系。\n"
                 "3d) 【交付标准】每个任务的 message 都必须写清交付标准，四项缺一不可：\n"
                 "   · 交付物：一份 Markdown 文件，写在该蛋【自己的工作目录根目录】下——"
                 "就是用户在「审阅代码」里看到的那个目录；路径统一用 <角色名>.md"
-                "（例如 正方一辩(支持方).md）；禁止写进 agent_data/（SDK 内部目录，"
+                "（例如 调研报告.md / 方案A.md，用本节点角色或职责命名）；禁止写进 agent_data/（SDK 内部目录，"
                 "用户在「审阅代码」里看不到）；\n"
                 "   · 内容：只写本节点负责的结论，不复述其它蛋的内容；\n"
                 "   · 验收：写完后读回该文件，确认已写入且非空；\n"
                 "   · 通知：在回复里写明交付物路径，并在 notify 里写清要通知的蛋。\n"
                 "只在聊天里说“已完成”而不落盘，一律视为【未交付】：系统会核验文件、"
                 "在监控面板里标出【未交付】，你也必须据此重新派活并要求写盘。\n"
+                "   · 你下达的每条 message 都必须把【交付标准】和【唯一交付路径（文件名）】"
+                "写清楚（即使后端会自动补一段标准，你仍应在指令里点明），并让该标准可核验"
+                "（系统能检查文件是否存在、是否非空、是否在你指定的路径）。\n"
                 "3e) depends_on 写在每个任务里；若整轮任务都等待同一批上游，"
                 "也可以把 depends_on 写在 decision 顶层（会套用到本轮每个任务）。\n"
                 "4) 【授权与等待分开】deliver 只表示允许读取某只蛋已经生成的结论，不表示"
@@ -2536,6 +2066,12 @@ class Canvas:
                 "不会传递给你，你也不需要它们——你看到的就是各蛋的实际结论。\n"
                 "9) 任务完成时 action='finish'，并在 summary 里给出最终总结；"
                 "否则 action='dispatch' 给出本轮 tasks。\n"
+                "10) 【自我恢复（恢复清醒）】如果你发现自己陷入混乱——例如同一只蛋被"
+                "反复派同样的活、连续多轮空转没有进展、监控里出现多个【长期运行未交付】、"
+                "或本轮输出无法解析——请【先停下来重新理清局势】，再决定下一步，"
+                "不要带病继续盲目派活。做法：重新读一遍【已有的结论盒子】与【待办任务】，"
+                "确认用户指令真正还要什么；把目标、交付标准、依赖关系重写清晰；"
+                "对卡住的蛋改用更短、更明确的指令或换蛋。一句话：混乱时先收敛、再派活。\n"
                 "返回结构化 decision（action + "
                 "tasks[egg_id, message, deliver, notify, depends_on] + "
                 "summary + note）。note 用一句中文说明本轮意图。"
@@ -2602,6 +2138,8 @@ class Canvas:
                 f"用户指令：{text}\n\n"
                 f"这是第 {round_no} 轮。请只决定【本轮】的动作。"
             )
+            # 轨迹完整性：规划器每轮实际收到的完整提示词也要进总指挥轨迹。
+            self.commander._record("system", "prompt", text=prompt)
             # The planner agent is created fresh每 round, so a corrupt history is
             # unlikely — but the model can still return an EMPTY turn, which the
             # server rejects with HTTP 400 "Assistant message must contain either
@@ -2851,15 +2389,21 @@ class Canvas:
             facts = getattr(egg, "last_completion", None) or {}
             try:
                 # Authoritative for the run that just finished.
-                return int(facts.get("reply_len") or 0) > 0
+                if int(facts.get("reply_len") or 0) > 0:
+                    # A "reply" that is only a tool call leaked into plain
+                    # text is not a conclusion: nothing was executed and the
+                    # egg never reported back (未复命).
+                    return not _looks_like_tool_call(self._assistant_only(egg, rec))
+                return False
             except Exception:
                 pass
         # Fallback for eggs without completion facts: strip the activity lines.
+        lines = []
         for raw in str(rec.get("reply") or "").splitlines():
             s = raw.strip()
             if s and not s.startswith(_ACTIVITY_PREFIXES):
-                return True
-        return False
+                lines.append(s)
+        return bool(lines) and not _looks_like_tool_call("\n".join(lines))
 
     def _run_was_cut_off(self, rec):
         """True when the turn was aborted mid-flight (stall / upstream error)."""
@@ -2906,7 +2450,7 @@ class Canvas:
     def _delivery_path(self, egg, message):
         """The ONE deliverable file of a task.
 
-        The commander usually names it (``正方一辩(支持方).md``); when it does
+        The commander usually names it (``角色名.md``); when it does
         not, a stable default is derived from the egg's title so every task
         still has exactly one unambiguous artifact to verify.
 
@@ -2921,10 +2465,17 @@ class Canvas:
         if m:
             # Normalize "agent_data/x.md" -> "x.md" (the reviewable location).
             return m.group(0).split("agent_data/", 1)[1]
-        # A relative path named by the commander (e.g. 结论.md / docs/结论.md).
-        m = re.search(r"(?<![\w.\\-])((?:[^\s`'\"/\\]+/)*[^\s`'\"/\\]+\.md)", text)
+        # The delivery contract's own "写成 Markdown 文件 X.md" is authoritative.
+        # Other .md mentions in the message (peer artifacts, quoted absolute
+        # paths inside tool-call text) are references, never the deliverable.
+        m = re.search(r"Markdown 文件\s+((?:[^\s`'\"/\\，]+/)*[^\s`'\"/\\，]+\.md)", text)
         if m and m.group(1) != "README.md":
             return m.group(1)
+        # A relative path named by the commander (e.g. 结论.md / docs/结论.md).
+        # Absolute-path fragments are skipped by _named_md_paths.
+        for cand in _named_md_paths(text):
+            if cand != "README.md":
+                return cand
         title = str(getattr(egg, "title", "") or "").strip()
         safe = re.sub(r'[\\/:*?"<>|\s]+', "_", title).strip("_")
         return f"{safe or '交付物'}.md"
@@ -2934,8 +2485,11 @@ class Canvas:
         text = str(message or "")
         if re.search(r"agent_data/[^\s`'\"]+?\.md", text):
             return True
-        m = re.search(r"(?<![\w.\\-])((?:[^\s`'\"/\\]+/)*[^\s`'\"/\\]+\.md)", text)
-        return bool(m and m.group(1) != "README.md")
+        if re.search(r"Markdown 文件\s+(?:[^\s`'\"/\\，]+/)*[^\s`'\"/\\，]+\.md", text):
+            return True
+        # Absolute-path fragments are references, not a named deliverable —
+        # they must not suppress the contract (_named_md_paths skips them).
+        return any(cand != "README.md" for cand in _named_md_paths(text))
 
     def _delivery_standard(self, egg, message):
         """The explicit delivery contract handed to every dispatched egg."""
@@ -2956,7 +2510,7 @@ class Canvas:
     def _peer_directories_block(self, egg_ids):
         """A compact list of each participant egg's deliverable directory.
 
-        A sub-egg (e.g. the debate judge) must READ what its peers actually
+        A sub-egg (e.g. an aggregating egg) must READ what its peers actually
         produced, but it only knows its OWN workspace. We hand it the other
         participants' worktree roots — that root IS the directory the user sees
         in 「审阅代码」, where every deliverable .md lands. The block is appended
@@ -2979,9 +2533,8 @@ class Canvas:
         if not rows:
             return ""
         return (
-            "\n\n【协作蛋交付物目录】需要参照其他蛋的真实产出时，可用 view_file / "
-            "list_directory 读取以下工作目录中的交付物 .md 文件（这些目录即用户在"
-            "「审阅代码」中看到的目录，交付物都落在其根目录下）：\n" + "\n".join(rows)
+            "\n\n【交付物目录】需要参照其他蛋的真实产出时，可用 view_file / "
+            "list_directory 读取以下工作目录中的交付物 .md 文件：\n" + "\n".join(rows)
         )
 
     def _verify_delivery(self, egg, message, started_at=None):
@@ -2991,7 +2544,7 @@ class Canvas:
         it”, so the answer is always objective: does the file exist, is it
         non-empty, and was it written during this run? A file written outside
         the agreed path still counts as delivered (the path drift is reported),
-        because the CONTENT is what the debate needs.
+        because the CONTENT is what the task needs.
         """
         expected = self._delivery_path(egg, message)
         base = None
@@ -3063,21 +2616,26 @@ class Canvas:
                 "detail": f"未交付：找不到交付物 {expected}"}
 
     def _fake_commander_decide(self, text, targets, boxes, round_no):
-        """Return a controlled error; never invent a task when the planner fails.
+        """Recover from a failed planner turn instead of halting the run.
 
-        The scheduler cannot infer phase/role semantics from a failed model response.
-        Returning an explicit error is safer than repeatedly dispatching the first
-        missing egg and falsely making progress.
+        A malformed or unparseable Commander response must not crash the schedule.
+        We return a harmless dispatch with no tasks of its own; the scheduler’s
+        scheduling-protection then re-grounds on the real state -- re-dispatching
+        any target egg that still has no conclusion, or finishing cleanly if all
+        are already delivered. This is the Commander recovering clarity: it stops
+        emitting blind instructions and lets the deterministic safety net drive a
+        clean, state-derived next step. Eggs run on their own, so the work still
+        completes even when the Commander model itself is malfunctioning.
         """
         return {
-            "action": "error",
+            "action": "dispatch",
             "tasks": [],
             "summary": (
                 f"总指挥第 {round_no} 轮决策输出无法解析或不可用。"
-                "已停止自动调度以避免重复派活或越过阶段；当前未完成任务不会被报告为成功。"
-                "请重试，或检查总指挥的结构化输出。"
+                "已自动恢复：不盲目收尾，由调度保护依据实际状态重新派发尚未交付的蛋，"
+                "或在其全部交付后干净收尾。"
             ),
-            "note": "决策失败：未生成回退任务。",
+            "note": "总指挥输出无法解析；已自动恢复清醒，由调度保护重新派发尚未交付的蛋，不盲目收尾。",
         }
 
     def _planner_chunk_text(self, chunk):
@@ -3200,6 +2758,40 @@ class Canvas:
                 idx = closed + 1
         return out
 
+    def _repair_json(self, text):
+        '''Best-effort repair of malformed JSON that local models sometimes emit.
+
+        The common failure is a missing structural colon between a key and its
+        value (e.g. a key missing its colon, so the object will not parse).
+        A quoted token immediately followed (after optional whitespace) by a
+        value-start token (another string, {, [, a number, or true/false/null)
+        is given a colon. This is safe: valid JSON never has a quoted token
+        directly followed by a value-start without a colon or comma in between,
+        so repairing can never corrupt a well-formed object. Any trailing comma
+        before } or ] is also stripped.
+        '''
+        if not text:
+            return text
+        bs = chr(92)
+        q = chr(34)
+        # 1) drop trailing commas before } or ]
+        s = re.sub(r',\s*([}\]])', r'\1', text)
+        # 2) insert a missing colon after a quoted key when followed by a value
+        inner = '(?:[^' + q + bs + bs + ']|' + bs + bs + '.)*'
+        pat = '(' + q + inner + q + ')' + bs + 's*(?=' + q + '|' + bs + '{|' + bs + '[|' + bs + 'd|true|false|null)'
+        s = re.sub(pat, bs + '1: ', s)
+        return s
+
+    def _safe_loads(self, text):
+        '''json.loads with a malformed-JSON repair fallback; returns None on failure.'''
+        try:
+            return json.loads(text)
+        except Exception:
+            try:
+                return json.loads(self._repair_json(text))
+            except Exception:
+                return None
+
     def _parse_decision_text(self, text):
         """Parse a commander decision out of raw model output.
 
@@ -3224,7 +2816,7 @@ class Canvas:
 
         # 1) the whole thing may be JSON
         try:
-            obj = json.loads(text)
+            obj = self._safe_loads(text)
             if isinstance(obj, dict):
                 candidates.append(obj)
         except Exception:
@@ -3246,7 +2838,7 @@ class Canvas:
             obj = cand if isinstance(cand, dict) else None
             if obj is None:
                 try:
-                    obj = json.loads(cand)
+                    obj = self._safe_loads(cand)
                 except Exception:
                     continue
             if not isinstance(obj, dict):
@@ -3522,3 +3114,4 @@ class Canvas:
         if target and target in self.eggs:
             lines.append(f"协调目标：{self.eggs[target].title}")
         return "\n".join(lines)
+

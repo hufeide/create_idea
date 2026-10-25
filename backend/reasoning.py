@@ -64,6 +64,7 @@ async def capture_reasoning(system_instructions, text):
     url = OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
     got = False
     total = 0
+    finished = False  # probe ran to completion (not cancelled / not a net error)
     try:
         async with httpx.AsyncClient(timeout=None) as cli:
             async with cli.stream("POST", url, json=payload, headers=headers) as r:
@@ -91,10 +92,19 @@ async def capture_reasoning(system_instructions, text):
                             # of streaming the whole answer a second time.
                             stop = True
                     if stop or total >= _MAX_REASON_CHARS:
+                        finished = True
                         return
+                # The stream ended on its own: the probe completed.
+                finished = True
     except asyncio.CancelledError:
         raise
     except Exception:
         return  # best-effort: never break the actual run
     finally:
-        _REASONING["supported"] = got
+        # Only a COMPLETED probe says anything about support: a stream that ran
+        # to its end with no reasoning means the model doesn't reason. A probe
+        # that was cancelled (e.g. _REASON_TIMEOUT) or died on a transient
+        # network error must NOT set supported=False — that would permanently
+        # disable capture although the model may reason just fine.
+        if finished:
+            _REASONING["supported"] = got

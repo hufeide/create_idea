@@ -933,9 +933,12 @@ function renderTrace(data, key){
   const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 30;
   const prevTop = body.scrollTop;
   body.innerHTML='';
-  const list=data.transcript||[];
+  // 子蛋与总指挥的轨迹面板都只显示 user / assistant 的非思考记录；
+  // 💭思考、🔧工具调用/结果与 system 记录仍由后端完整返回，只是不在此展示。
+  const list=(data.transcript||[]).filter(it=>
+    it && (it.role==='user'||it.role==='assistant') && it.kind!=='thought');
   if(!list.length){
-    body.innerHTML='<div class="trace-item"><div class="empty">暂无对话记录。向该蛋发送命令后，这里会按时间顺序显示：用户指令、模型回复、思考（💭）与工具调用/结果。</div></div>';
+    body.innerHTML='<div class="trace-item"><div class="empty">暂无对话记录。向该蛋发送命令后，这里会按时间顺序显示用户指令与模型回复。</div></div>';
     return;
   }
   for(let idx=0; idx<list.length; idx++){
@@ -943,7 +946,7 @@ function renderTrace(data, key){
     const div=document.createElement('div');
     div.className='trace-item';                  // thoughts start EXPANDED in the trace
     const ts=(it.ts||'').split('T')[1] || it.ts || '';
-    const KIND_LABEL={user:'用户',system:'系统',assistant:'模型',tool:'工具',thought:'思考',tool_call:'工具调用',tool_result:'工具结果',system_prompt:'系统提示词',tools:'可用工具',prompt:'发送提示词',plan:'指挥计划',status:'状态',phase:'阶段'};
+    const KIND_LABEL={user:'用户',system:'系统',assistant:'模型',tool:'工具',thought:'思考',tool_call:'工具调用',tool_result:'工具结果',system_prompt:'系统提示词',tools:'可用工具',prompt:'发送提示词',plan:'指挥计划',status:'状态',phase:'阶段',instruct:'派发指令',report:'子蛋复命'};
     const kindLabel = KIND_LABEL[it.kind] || it.kind;
     const roleCls = it.role==='user'?'user':(it.role==='assistant'?'assistant':(it.role==='tool'?'tool':'system'));
     let head = `<span class="role ${roleCls}">${it.role}</span><span class="kind">${esc(kindLabel)}</span>`;

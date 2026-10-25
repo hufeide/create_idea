@@ -152,6 +152,9 @@ class EggAgent:
         # ("Assistant message must contain either 'content' or 'tool_calls'!").
         # We detect that and drop the conversation before it can poison a turn.
         self._turn_payload = False
+        # Per-run flag: the fully-assembled model input (with injected neighbour
+        # context) is recorded into the trace only once per run, not per retry.
+        self._prompt_recorded = False
         # Chronological conversation trace (user commands, model text/thoughts,
         # system prompt, tool calls/results) — viewable via /api/trace/{egg_id}.
         self.transcript = []
@@ -465,7 +468,7 @@ class EggAgent:
                 # Fire-and-forget on the running loop: the halt_request is what
                 # really stops the backend turn; we don't need to await it.
                 asyncio.ensure_future(resp.cancel()).add_done_callback(
-                    lambda fut: fut.exception()  # swallow cancellation-side errors
+                    lambda fut: None if fut.cancelled() else fut.exception()
                 )
             except RuntimeError:
                 pass  # no running loop (e.g. during shutdown) — local cancel stands
@@ -492,6 +495,11 @@ class EggAgent:
                 "【以上为参考上下文。以下是用户给你的指令】\n"
                 f"{text}"
             )
+            if not self._prompt_recorded:
+                self._prompt_recorded = True
+                # 记录实际发送给模型的完整输入（含注入的邻居上下文）——轨迹必须
+                # 反映模型真实看到的交互内容，而不仅是用户敲下的那句指令。
+                self._record("system", "prompt", text=text)
         self._turn_tool_calls = 0
         self._got_tool_result = False
         resp = await self._agent.chat(text)
@@ -570,6 +578,7 @@ class EggAgent:
         and is retried every ``_LLM_BOX.delay`` seconds on failure.
         """
         self._record("user", "text", text=text)
+        self._prompt_recorded = False
         if not SDK_OK:
             self._record("system", "status",
                          text="⚠ 该蛋的 LLM SDK 不可用（未安装 google.antigravity）。")
@@ -730,17 +739,21 @@ class EggAgent:
             msg = self._offline_msg("压缩会话")
             self._record("system", "status", text=msg)
             return msg
-        async with self._lock:
-            self.busy = True
-            self._task = asyncio.current_task()
-            try:
+        # Mark busy + capture the task BEFORE waiting for the lock — same as
+        # run(): a compress queued behind an in-flight run must show 运行中 and
+        # stay cancellable via the stop button, not look 空闲.
+        self.busy = True
+        self._task = asyncio.current_task()
+        try:
+            async with self._lock:
                 summary = None
+                prompt = ("将我们到目前为止的对话压缩为一段简洁的规格说明"
+                          "（markdown），只保留关键决策与产出。")
+                # 压缩实际发送的提示词与 user 记录措辞不同，如实记入轨迹。
+                self._record("system", "prompt", text=prompt)
                 for attempt in range(1, _LLM_BOX.max_attempts + 1):
                     try:
-                        resp = await self._agent.chat(
-                            "将我们到目前为止的对话压缩为一段简洁的规格说明"
-                            "（markdown），只保留关键决策与产出。"
-                        )
+                        resp = await self._agent.chat(prompt)
                         self._active_resp = resp
                         try:
                             summary = await resp.text()
@@ -760,9 +773,9 @@ class EggAgent:
                 summary = summary or ""
                 self._record("assistant", "text", text=summary)
                 return summary
-            finally:
-                self.busy = False
-                self._task = None
+        finally:
+            self.busy = False
+            self._task = None
 
     # ---- conversation history (used when combining eggs) ----
     def history_text(self, mode="brief", limit=None):

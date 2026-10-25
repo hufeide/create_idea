@@ -179,9 +179,9 @@ def build_agent_config(
         base["model"] = OPENAI_MODEL
         base["base_url"] = OPENAI_BASE_URL
         base["compaction_config"] = types.CompactionConfig(
-            token_threshold=15360,
-            checkpoint_interval_tokens=10240,
-            max_context_tokens=40960,
+            token_threshold=35360,
+            checkpoint_interval_tokens=30240,
+            max_context_tokens=50960,
         )
         cls = LocalOpenAIAgentConfig
     else:  # cloud
